@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<manifest>
+  <project name="platform/prebuilts/vndk/v30"
+           path="prebuilts/vndk/v30"
+           remote="aosp"
+           revision="5f9884aa352825291757dfd6694b874ad8c1805e"
+           clone-depth="1" />
+</manifest>

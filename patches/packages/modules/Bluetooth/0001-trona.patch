@@ -1,0 +1,19 @@
+diff --git a/system/gd/hci/hci_layer.cc b/system/gd/hci/hci_layer.cc
+index fd85769..10d6b4f 100644
+--- a/system/gd/hci/hci_layer.cc
++++ b/system/gd/hci/hci_layer.cc
+@@ -260,7 +260,13 @@ struct HciLayer::impl {
+     using WaitingFor = CommandQueueEntry::WaitingFor;
+     WaitingFor waiting_for = command_queue_.front().waiting_for_;
+     CommandStatusView status_view = CommandStatusView::Create(event);
+-    if (is_vendor_specific && (is_status && waiting_for == WaitingFor::COMPLETE) &&
++    // trona: the MT8183 combo controller advertises READ_DEFAULT_ERRONEOUS_DATA_REPORTING but
++    // answers it with Command Status UNKNOWN_HCI_COMMAND. Its handler already tolerates failure
++    // (b/277589118), so route that status to it like an unsupported vendor command.
++    bool is_optional_unsupported_probe =
++            op_code == OpCode::READ_DEFAULT_ERRONEOUS_DATA_REPORTING;
++    if ((is_vendor_specific || is_optional_unsupported_probe) &&
++        (is_status && waiting_for == WaitingFor::COMPLETE) &&
+         (status_view.IsValid() && status_view.GetStatus() == ErrorCode::UNKNOWN_HCI_COMMAND)) {
+       // If this is a command status of a vendor specific command, and command complete is expected,
+       // we can't treat this as hard failure since we have no way of probing this lack of support at

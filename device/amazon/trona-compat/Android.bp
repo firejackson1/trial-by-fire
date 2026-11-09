@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+package {
+    default_applicable_licenses: ["Android-Apache-2.0"],
+}
+
+apex_vndk {
+    name: "com.android.vndk.v30",
+    defaults: ["vndk-apex-defaults"],
+    vndk_version: "30",
+    system_ext_specific: true,
+}
+

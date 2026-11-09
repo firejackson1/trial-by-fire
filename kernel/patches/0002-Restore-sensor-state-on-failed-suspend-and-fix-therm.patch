@@ -1,0 +1,298 @@
+From 68d3394ddde560af6f7ada95f7bc78fcf532693e Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Mon, 2 Nov 2026 21:30:01 -0500
+Subject: [PATCH 2/2] Restore sensor state on failed suspend and fix thermal
+ variants
+
+---
+ .../alsps/ltrx130a_dual/ltrx130a_dual.c       | 38 ++++++-----
+ .../alsps/stk3x1x_dual/stk3x1x_dual.c         | 36 ++++++----
+ include/linux/thermal_framework.h             |  3 +-
+ .../mediatek/check_sensor_suspend.py          | 68 +++++++++++++++----
+ .../mediatek/check_thermal_helper.py          | 29 ++++++++
+ 5 files changed, 127 insertions(+), 47 deletions(-)
+ create mode 100755 tools/testing/selftests/mediatek/check_thermal_helper.py
+
+diff --git a/drivers/misc/mediatek/sensors-1.0/alsps/ltrx130a_dual/ltrx130a_dual.c b/drivers/misc/mediatek/sensors-1.0/alsps/ltrx130a_dual/ltrx130a_dual.c
+index 02bbcb91378..e491f177994 100644
+--- a/drivers/misc/mediatek/sensors-1.0/alsps/ltrx130a_dual/ltrx130a_dual.c
++++ b/drivers/misc/mediatek/sensors-1.0/alsps/ltrx130a_dual/ltrx130a_dual.c
+@@ -2054,7 +2054,9 @@ static int ltrx130a_i2c_detect(struct i2c_client *client, struct i2c_board_info
+ 
+ static int ltrx130a_i2c_suspend(struct device *dev)
+ {
++	unsigned long restore_mask = 0;
+ 	int err = 0;
++	int restore_err;
+ 	int i;
+ 
+ 	APS_FUN();
+@@ -2063,35 +2065,37 @@ static int ltrx130a_i2c_suspend(struct device *dev)
+ 		return 0;
+ 
+ 	alsps_driver_pause_polling(1);
+-
+ 	atomic_set(&ltrx130a_dual.als_suspend, 1);
+ 
+ 	for (i = 0; i < ltrx130a_dual.als_count; i++) {
+-		struct i2c_client *client = NULL;
++		struct i2c_client *client;
+ 
+ 		if (!ltrx130a_dual.als[i]) {
+-			APS_ERR("null pointer!!\n");
+-
+-			atomic_set(&ltrx130a_dual.als_suspend, 0);
+-			alsps_driver_pause_polling(0);
+-			return -EINVAL;
++			err = -EINVAL;
++			goto rollback;
+ 		}
+-
++		if (test_bit(CMC_BIT_ALS, &ltrx130a_dual.als[i]->enable))
++			restore_mask |= BIT(i);
+ 		client = ltrx130a_dual.als[i]->client;
+-
+ 		err = ltrx130a_als_enable(client, 0);
+ 		if (err < 0)
+-			break;
+-	}
+-
+-	if (err < 0) {
+-		APS_ERR("disable als: %d\n", err);
+-		atomic_set(&ltrx130a_dual.als_suspend, 0);
+-		alsps_driver_pause_polling(0);
+-		return err;
++			goto rollback;
+ 	}
+ 
+ 	return 0;
++
++rollback:
++	/* Restore enabled sensors before allowing polling to resume. */
++	for (; i >= 0; i--) {
++		if (!(restore_mask & BIT(i)))
++			continue;
++		restore_err = ltrx130a_als_enable(ltrx130a_dual.als[i]->client, 1);
++		if (restore_err < 0)
++			APS_ERR("restore als failed: %d\n", restore_err);
++	}
++	atomic_set(&ltrx130a_dual.als_suspend, 0);
++	alsps_driver_pause_polling(0);
++	return err;
+ }
+ 
+ static int ltrx130a_i2c_resume(struct device *dev)
+diff --git a/drivers/misc/mediatek/sensors-1.0/alsps/stk3x1x_dual/stk3x1x_dual.c b/drivers/misc/mediatek/sensors-1.0/alsps/stk3x1x_dual/stk3x1x_dual.c
+index 382bafeb2d4..9e70a89eff5 100644
+--- a/drivers/misc/mediatek/sensors-1.0/alsps/stk3x1x_dual/stk3x1x_dual.c
++++ b/drivers/misc/mediatek/sensors-1.0/alsps/stk3x1x_dual/stk3x1x_dual.c
+@@ -2087,8 +2087,10 @@ static struct miscdevice stk3x1x_device = {
+ #ifdef CONFIG_PM_SLEEP
+ static int stk3x1x_suspend(struct device *dev)
+ {
+-	int i;
++	unsigned long restore_mask = 0;
+ 	int err = 0;
++	int restore_err;
++	int i;
+ 
+ 	APS_FUN();
+ 
+@@ -2102,25 +2104,31 @@ static int stk3x1x_suspend(struct device *dev)
+ 		struct i2c_client *client;
+ 
+ 		if (!stk3x1x_dual.als[i]) {
+-			atomic_set(&stk3x1x_dual.als_suspend, 0);
+-			alsps_driver_pause_polling(0);
+-			return -EINVAL;
++			err = -EINVAL;
++			goto rollback;
+ 		}
++		if (atomic_read(&stk3x1x_dual.als[i]->state_val) & STK_STATE_EN_ALS_MASK)
++			restore_mask |= BIT(i);
+ 		client = stk3x1x_dual.als[i]->client;
+-
+ 		err = stk3x1x_enable_als(client, 0);
+-		if (err)
+-			break;
+-	}
+-
+-	if (err) {
+-		atomic_set(&stk3x1x_dual.als_suspend, 0);
+-		alsps_driver_pause_polling(0);
+-		APS_ERR("disable als fail: %d\n", err);
+-		return err;
++		if (err < 0)
++			goto rollback;
+ 	}
+ 
+ 	return 0;
++
++rollback:
++	/* Restore enabled sensors before allowing polling to resume. */
++	for (; i >= 0; i--) {
++		if (!(restore_mask & BIT(i)))
++			continue;
++		restore_err = stk3x1x_enable_als(stk3x1x_dual.als[i]->client, 1);
++		if (restore_err < 0)
++			APS_ERR("restore als failed: %d\n", restore_err);
++	}
++	atomic_set(&stk3x1x_dual.als_suspend, 0);
++	alsps_driver_pause_polling(0);
++	return err;
+ }
+ 
+ static int stk3x1x_resume(struct device *dev)
+diff --git a/include/linux/thermal_framework.h b/include/linux/thermal_framework.h
+index d459585162b..9776110c931 100644
+--- a/include/linux/thermal_framework.h
++++ b/include/linux/thermal_framework.h
+@@ -284,7 +284,8 @@ extern int thermal_level_compare(struct mtk_cooler_platform_data *cooler_data,
+ 		struct cooler_sort_list *head, bool positive_seq);
+ #endif
+ 
+-#ifdef CONFIG_THERMAL_SHUTDOWN_LAST_KMESG
++#if defined(CONFIG_THERMAL_SHUTDOWN_LAST_KMESG) || \
++	defined(CONFIG_VIRTUAL_SENSOR_THERMAL)
+ void last_kmsg_thermal_shutdown(void);
+ #else
+ static inline void last_kmsg_thermal_shutdown(void) {}
+diff --git a/tools/testing/selftests/mediatek/check_sensor_suspend.py b/tools/testing/selftests/mediatek/check_sensor_suspend.py
+index 9bd15dec0fc..7e2c279101f 100755
+--- a/tools/testing/selftests/mediatek/check_sensor_suspend.py
++++ b/tools/testing/selftests/mediatek/check_sensor_suspend.py
+@@ -23,38 +23,76 @@ prefix = r"""
+ #include <stddef.h>
+ struct device { int unused; };
+ struct i2c_client { int index; };
+-struct sensor { struct i2c_client *client; };
++struct sensor { struct i2c_client *client; unsigned long enable; int state_val; };
+ static struct { int als_suspend, als_count; struct sensor *als[2]; } ltrx130a_dual;
+-static int paused, calls, results[2];
++static int paused, calls, disables, restores, active[2], results[2], restore_results[2];
+ #define APS_FUN() ((void)0)
+ #define APS_ERR(...) ((void)0)
+ #define atomic_read(p) (*(p))
+ #define atomic_set(p, v) (*(p) = (v))
++#define BIT(i) (1UL << (i))
++#define CMC_BIT_ALS 1
++#define STK_STATE_EN_ALS_MASK 2
++#define test_bit(i, p) ((*(p) & BIT(i)) != 0)
+ static void alsps_driver_pause_polling(int value) { paused = value; }
+ static int ltrx130a_als_enable(struct i2c_client *client, int enabled) {
+-    (void)enabled; ++calls; return results[client->index];
++    int i = client->index;
++    int result = enabled ? restore_results[i] : results[i];
++    ++calls;
++    if (enabled) { ++restores; assert(paused); } else { ++disables; }
++    if (!result) {
++        active[i] = enabled;
++        if (ltrx130a_dual.als[i])
++            ltrx130a_dual.als[i]->state_val = enabled ? STK_STATE_EN_ALS_MASK : 0;
++    }
++    return result;
+ }
+ """
+ cases = r"""
+-int main(void) {
+-    struct i2c_client clients[] = {{0}, {1}};
+-    struct sensor sensors[] = {{&clients[0]}, {&clients[1]}};
++static struct i2c_client clients[] = {{0}, {1}};
++static struct sensor sensors[2];
++static void reset(void) {
++    int i;
++    paused = calls = disables = restores = ltrx130a_dual.als_suspend = 0;
+     ltrx130a_dual.als_count = 2;
+-    ltrx130a_dual.als[0] = &sensors[0];
+-    ltrx130a_dual.als[1] = &sensors[1];
++    for (i = 0; i < 2; ++i) {
++        sensors[i].client = &clients[i];
++        sensors[i].enable = BIT(CMC_BIT_ALS);
++        sensors[i].state_val = STK_STATE_EN_ALS_MASK;
++        ltrx130a_dual.als[i] = &sensors[i];
++        active[i] = 1;
++        results[i] = restore_results[i] = 0;
++    }
++}
++int main(void) {
++    reset();
+     results[0] = -EIO;
+     assert(ltrx130a_i2c_suspend(NULL) == -EIO);
+-    assert(calls == 1 && !paused && !ltrx130a_dual.als_suspend);
+-    results[0] = 0; calls = 0;
++    assert(disables == 1 && !paused && !ltrx130a_dual.als_suspend);
++    assert(active[0] && active[1]);
++    reset();
+     assert(ltrx130a_i2c_suspend(NULL) == 0);
+-    assert(calls == 2 && paused && ltrx130a_dual.als_suspend);
++    assert(disables == 2 && paused && ltrx130a_dual.als_suspend);
++    assert(!active[0] && !active[1]);
+     assert(ltrx130a_i2c_suspend(NULL) == 0 && calls == 2);
+-    ltrx130a_dual.als_suspend = 0; calls = 0; results[1] = -EINVAL;
++    reset(); results[1] = -EINVAL;
++    assert(ltrx130a_i2c_suspend(NULL) == -EINVAL);
++    assert(disables == 2 && !paused && !ltrx130a_dual.als_suspend);
++    assert(active[0] && active[1]);
++    reset(); ltrx130a_dual.als[1] = NULL;
++    assert(ltrx130a_i2c_suspend(NULL) == -EINVAL);
++    assert(active[0] && !paused && !ltrx130a_dual.als_suspend);
++    reset(); active[0] = sensors[0].enable = sensors[0].state_val = 0;
++    results[1] = -EINVAL;
++    assert(ltrx130a_i2c_suspend(NULL) == -EINVAL);
++    assert(!active[0] && active[1]);
++    reset(); results[1] = -EINVAL; restore_results[0] = -EIO;
+     assert(ltrx130a_i2c_suspend(NULL) == -EINVAL);
+-    assert(calls == 2 && !paused && !ltrx130a_dual.als_suspend);
+-    ltrx130a_dual.als[0] = NULL; calls = 0;
++    assert(restores && !paused && !ltrx130a_dual.als_suspend);
++    reset(); ltrx130a_dual.als[0] = NULL;
+     assert(ltrx130a_i2c_suspend(NULL) == -EINVAL);
+     assert(!calls && !paused && !ltrx130a_dual.als_suspend);
++    reset();
+     ltrx130a_dual.als_count = 0;
+     assert(ltrx130a_i2c_suspend(NULL) == 0);
+     return 0;
+@@ -67,4 +105,4 @@ with tempfile.TemporaryDirectory(prefix="trona-suspend-") as temporary:
+     (path / "check.c").write_text(prefix + function + cases)
+     subprocess.run(["gcc", "-std=c99", "-O0", str(path / "check.c"), "-o", str(path / "check")], check=True)
+     subprocess.run([str(path / "check")], check=True, cwd=path)
+-print("PASS:", driver, "suspend propagates errors and restores polling state")
++print("PASS:", driver, "suspend error propagation, sensor rollback and polling state")
+diff --git a/tools/testing/selftests/mediatek/check_thermal_helper.py b/tools/testing/selftests/mediatek/check_thermal_helper.py
+new file mode 100755
+index 00000000000..3fbe7d4327e
+--- /dev/null
++++ b/tools/testing/selftests/mediatek/check_thermal_helper.py
+@@ -0,0 +1,29 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0
++"""Compile the real optional thermal-helper declaration in each provider mode."""
++import pathlib
++import subprocess
++import sys
++import tempfile
++
++header = (pathlib.Path(sys.argv[1]) / "include/linux/thermal_framework.h").read_text()
++declaration = header.index("void last_kmsg_thermal_shutdown(void);")
++start = header.rfind("#if", 0, declaration)
++end = header.index("#endif", declaration) + len("#endif")
++block = header[start:end]
++cases = {
++    "logging-disabled": ("#define CONFIG_AMZN_THERMAL_VIRTUAL_SENSOR 1\n", False),
++    "tablet-logging": ("#define CONFIG_THERMAL_SHUTDOWN_LAST_KMESG 1\n", True),
++    "legacy-provider": ("#define CONFIG_VIRTUAL_SENSOR_THERMAL 1\n", True),
++}
++with tempfile.TemporaryDirectory(prefix="trona-thermal-") as temporary:
++    path = pathlib.Path(temporary)
++    for name, (defines, provider) in cases.items():
++        body = defines + block + "\n"
++        if provider:
++            body += "void last_kmsg_thermal_shutdown(void) {}\n"
++        body += "int main(void) { last_kmsg_thermal_shutdown(); return 0; }\n"
++        (path / "check.c").write_text(body)
++        subprocess.run(["gcc", "-std=gnu89", "-Werror", str(path / "check.c"), "-o", str(path / "check")], check=True)
++        subprocess.run([str(path / "check")], check=True)
++        print("PASS:", name)
+-- 
+2.53.0
+

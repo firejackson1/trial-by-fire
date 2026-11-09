@@ -1,0 +1,364 @@
+From f74aa6ab905be3f37206c67ece7fb3fafb2c1dd5 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Mon, 2 Nov 2026 21:12:30 -0500
+Subject: [PATCH 1/2] Fix trona kernel build and sensor suspend error handling
+
+---
+ .../mediatek/NT36523/nt36xxx_mp_ctrlram.c     |  2 +-
+ .../alsps/ltrx130a_dual/ltrx130a_dual.c       | 18 +++--
+ .../alsps/stk3x1x_dual/stk3x1x_dual.c         | 37 +++++++---
+ drivers/thermal/virtual_sensor_tablet/Kconfig |  1 +
+ .../virtual_sensor_tablet_thermal.c           |  3 +-
+ include/linux/thermal_framework.h             |  4 ++
+ .../mediatek/check_sensor_suspend.py          | 70 +++++++++++++++++++
+ 7 files changed, 116 insertions(+), 19 deletions(-)
+ create mode 100755 tools/testing/selftests/mediatek/check_sensor_suspend.py
+
+diff --git a/drivers/input/touchscreen/mediatek/NT36523/nt36xxx_mp_ctrlram.c b/drivers/input/touchscreen/mediatek/NT36523/nt36xxx_mp_ctrlram.c
+index df583ac409b..693a7a98fda 100644
+--- a/drivers/input/touchscreen/mediatek/NT36523/nt36xxx_mp_ctrlram.c
++++ b/drivers/input/touchscreen/mediatek/NT36523/nt36xxx_mp_ctrlram.c
+@@ -1712,7 +1712,7 @@ static int32_t nvt_selftest_open(struct inode *inode, struct file *file)
+ 		 * Ex. nvt_pid = 500A
+ 		 *     mpcriteria = "novatek-mp-criteria-500A"
+ 		 */
+-		snprintf(mpcriteria, PAGE_SIZE, "novatek-mp-criteria-%04X", ts->nvt_pid);
++		snprintf(mpcriteria, sizeof(mpcriteria), "novatek-mp-criteria-%04X", ts->nvt_pid);
+ 
+ 		if (nvt_mp_parse_dt(np, mpcriteria)) {
+ 			mutex_unlock(&ts->lock);
+diff --git a/drivers/misc/mediatek/sensors-1.0/alsps/ltrx130a_dual/ltrx130a_dual.c b/drivers/misc/mediatek/sensors-1.0/alsps/ltrx130a_dual/ltrx130a_dual.c
+index 64748fefc66..02bbcb91378 100644
+--- a/drivers/misc/mediatek/sensors-1.0/alsps/ltrx130a_dual/ltrx130a_dual.c
++++ b/drivers/misc/mediatek/sensors-1.0/alsps/ltrx130a_dual/ltrx130a_dual.c
+@@ -1666,11 +1666,12 @@ static int als_open_report_data(int open)
+ static int als_enable_nodata(int en)
+ {
+ 	int res = 0;
++	int i;
+ 
+ 	APS_LOG("als enable value = %d\n", en);
+ 
+ 
+-	for (int i = 0; i < ltrx130a_dual.als_count; i++) {
++	for (i = 0; i < ltrx130a_dual.als_count; i++) {
+ 		res = ltrx130a_als_enable(ltrx130a_dual.als[i]->client, en);
+ 		if (res) {
+ 			APS_ERR("als_enable_nodata is failed!!\n");
+@@ -1782,8 +1783,9 @@ static void als_debug_log(int *lux_cali, int als_report)
+ static int als_get_lux(int *value)
+ {
+ 	int alslux[2] = {0};
++	int i;
+ 
+-	for (int i = MASTER; i < ltrx130a_dual.als_count; i++) {
++	for (i = MASTER; i < ltrx130a_dual.als_count; i++) {
+ 		struct ltrx130a_priv *obj = ltrx130a_dual.als[i];
+ 
+ 		if (!obj) {
+@@ -2052,7 +2054,8 @@ static int ltrx130a_i2c_detect(struct i2c_client *client, struct i2c_board_info
+ 
+ static int ltrx130a_i2c_suspend(struct device *dev)
+ {
+-	int err;
++	int err = 0;
++	int i;
+ 
+ 	APS_FUN();
+ 
+@@ -2063,7 +2066,7 @@ static int ltrx130a_i2c_suspend(struct device *dev)
+ 
+ 	atomic_set(&ltrx130a_dual.als_suspend, 1);
+ 
+-	for (int i = 0; i < ltrx130a_dual.als_count; i++) {
++	for (i = 0; i < ltrx130a_dual.als_count; i++) {
+ 		struct i2c_client *client = NULL;
+ 
+ 		if (!ltrx130a_dual.als[i]) {
+@@ -2076,7 +2079,9 @@ static int ltrx130a_i2c_suspend(struct device *dev)
+ 
+ 		client = ltrx130a_dual.als[i]->client;
+ 
+-		err &= ltrx130a_als_enable(client, 0);
++		err = ltrx130a_als_enable(client, 0);
++		if (err < 0)
++			break;
+ 	}
+ 
+ 	if (err < 0) {
+@@ -2092,13 +2097,14 @@ static int ltrx130a_i2c_suspend(struct device *dev)
+ static int ltrx130a_i2c_resume(struct device *dev)
+ {
+ 	int err;
++	int i;
+ 
+ 	APS_FUN();
+ 
+ 	if (!atomic_read(&ltrx130a_dual.als_suspend))
+ 		return 0;
+ 
+-	for (int i = 0; i < ltrx130a_dual.als_count; i++) {
++	for (i = 0; i < ltrx130a_dual.als_count; i++) {
+ 		struct ltrx130a_priv *obj = ltrx130a_dual.als[i];
+ 
+ 		if (!obj) {
+diff --git a/drivers/misc/mediatek/sensors-1.0/alsps/stk3x1x_dual/stk3x1x_dual.c b/drivers/misc/mediatek/sensors-1.0/alsps/stk3x1x_dual/stk3x1x_dual.c
+index 5fe25ffa01a..382bafeb2d4 100644
+--- a/drivers/misc/mediatek/sensors-1.0/alsps/stk3x1x_dual/stk3x1x_dual.c
++++ b/drivers/misc/mediatek/sensors-1.0/alsps/stk3x1x_dual/stk3x1x_dual.c
+@@ -1134,10 +1134,11 @@ static ssize_t stk3x1x_show_als_cali_2nd(struct device_driver *ddri, char *buf)
+ /*----------------------------------------------------------------------------*/
+ static ssize_t stk3x1x_show_config(struct device_driver *ddri, char *buf)
+ {
++	int i;
+ 	ssize_t res = 0;
+ 	struct stk3x1x_priv *obj;
+ 
+-	for (int i = 0; i < stk3x1x_dual.als_count; i++) {
++	for (i = 0; i < stk3x1x_dual.als_count; i++) {
+ 		obj = stk3x1x_dual.als[i];
+ 		if (!obj) {
+ 			APS_ERR("stk3x1x_obj is null!!\n");
+@@ -1155,10 +1156,11 @@ static ssize_t stk3x1x_show_config(struct device_driver *ddri, char *buf)
+ /*----------------------------------------------------------------------------*/
+ static ssize_t stk3x1x_show_trace(struct device_driver *ddri, char *buf)
+ {
++	int i;
+ 	ssize_t res;
+ 	struct stk3x1x_priv *obj;
+ 
+-	for (int i = 0; i < stk3x1x_dual.als_count; i++) {
++	for (i = 0; i < stk3x1x_dual.als_count; i++) {
+ 		obj = stk3x1x_dual.als[i];
+ 		if (!obj) {
+ 			APS_ERR("stk3x1x_obj is null!!\n");
+@@ -1965,6 +1967,7 @@ static int stk3x1x_release(struct inode *inode, struct file *file)
+ static long stk3x1x_unlocked_ioctl(struct file *file,
+ 				unsigned int cmd, unsigned long arg)
+ {
++	int i;
+ 	struct stk3x1x_priv *obj;
+ 	long err = 0;
+ 	void __user *ptr = (void __user *) arg;
+@@ -1979,7 +1982,7 @@ static long stk3x1x_unlocked_ioctl(struct file *file,
+ 		}
+ 
+ 		if (enable) {
+-			for (int i = 0; i < stk3x1x_dual.als_count; i++) {
++			for (i = 0; i < stk3x1x_dual.als_count; i++) {
+ 				obj = stk3x1x_dual.als[i];
+ 				if (obj)
+ 					err = stk3x1x_enable_als(obj->client, 1);
+@@ -1992,7 +1995,7 @@ static long stk3x1x_unlocked_ioctl(struct file *file,
+ 				set_bit(STK_BIT_ALS, &obj->enable);
+ 			}
+ 		} else {
+-			for (int i = 0; i < stk3x1x_dual.als_count; i++) {
++			for (i = 0; i < stk3x1x_dual.als_count; i++) {
+ 				obj = stk3x1x_dual.als[i];
+ 
+ 				err = stk3x1x_enable_als(obj->client, 0);
+@@ -2084,6 +2087,7 @@ static struct miscdevice stk3x1x_device = {
+ #ifdef CONFIG_PM_SLEEP
+ static int stk3x1x_suspend(struct device *dev)
+ {
++	int i;
+ 	int err = 0;
+ 
+ 	APS_FUN();
+@@ -2094,11 +2098,19 @@ static int stk3x1x_suspend(struct device *dev)
+ 	alsps_driver_pause_polling(1);
+ 	atomic_set(&stk3x1x_dual.als_suspend, 1);
+ 
+-	for (int i = 0; i < stk3x1x_dual.als_count; i++) {
+-		struct i2c_client *client =
+-			stk3x1x_dual.als[i]->client;
++	for (i = 0; i < stk3x1x_dual.als_count; i++) {
++		struct i2c_client *client;
++
++		if (!stk3x1x_dual.als[i]) {
++			atomic_set(&stk3x1x_dual.als_suspend, 0);
++			alsps_driver_pause_polling(0);
++			return -EINVAL;
++		}
++		client = stk3x1x_dual.als[i]->client;
+ 
+-		err &= stk3x1x_enable_als(client, 0);
++		err = stk3x1x_enable_als(client, 0);
++		if (err)
++			break;
+ 	}
+ 
+ 	if (err) {
+@@ -2113,6 +2125,7 @@ static int stk3x1x_suspend(struct device *dev)
+ 
+ static int stk3x1x_resume(struct device *dev)
+ {
++	int i;
+ 	int err = 0;
+ 
+ 	APS_FUN();
+@@ -2120,7 +2133,7 @@ static int stk3x1x_resume(struct device *dev)
+ 	if (!atomic_read(&stk3x1x_dual.als_suspend))
+ 		return 0;
+ 
+-	for (int i = 0; i < stk3x1x_dual.als_count; i++) {
++	for (i = 0; i < stk3x1x_dual.als_count; i++) {
+ 		struct i2c_client *client =
+ 				stk3x1x_dual.als[i]->client;
+ 
+@@ -2147,11 +2160,12 @@ static int als_open_report_data(int open)
+ 
+ static int als_enable_nodata(int en)
+ {
++	int i;
+ 	int res = 0;
+ 
+ 	APS_LOG("stk3x1x_obj als enable value = %d\n", en);
+ 
+-	for (int i = 0; i < stk3x1x_dual.als_count; i++) {
++	for (i = 0; i < stk3x1x_dual.als_count; i++) {
+ 
+ 		res = stk3x1x_enable_als(stk3x1x_dual.als[i]->client, en);
+ 
+@@ -2255,10 +2269,11 @@ static void als_debug_log(int *lux_cali, int als_report)
+ /*----------------------------------------------------------------------------*/
+ static int als_get_lux(int *value)
+ {
++	int i;
+ 	int err = 0;
+ 	int alslux[2] = {0};
+ 
+-	for (int i = MASTER; i < stk3x1x_dual.als_count; i++) {
++	for (i = MASTER; i < stk3x1x_dual.als_count; i++) {
+ 		struct stk3x1x_priv *obj = stk3x1x_dual.als[i];
+ 
+ 		if (!obj) {
+diff --git a/drivers/thermal/virtual_sensor_tablet/Kconfig b/drivers/thermal/virtual_sensor_tablet/Kconfig
+index d5ff10518c1..fce6283ba20 100644
+--- a/drivers/thermal/virtual_sensor_tablet/Kconfig
++++ b/drivers/thermal/virtual_sensor_tablet/Kconfig
+@@ -13,6 +13,7 @@ config AMZN_THERMAL_VIRTUAL_SENSOR
+      thermal zone if trip points reached.
+ 
+ config THERMAL_SHUTDOWN_LAST_KMESG
++   depends on AMZN_THERMAL_VIRTUAL_SENSOR
+    bool "THERMAL_SHUTDOWN_LAST_KMESG save the last kmsg"
+    help
+      Save the last kmsg when thermal shuts down the system.
+diff --git a/drivers/thermal/virtual_sensor_tablet/virtual_sensor_tablet_thermal.c b/drivers/thermal/virtual_sensor_tablet/virtual_sensor_tablet_thermal.c
+index 767aa6b4337..542795d1b77 100644
+--- a/drivers/thermal/virtual_sensor_tablet/virtual_sensor_tablet_thermal.c
++++ b/drivers/thermal/virtual_sensor_tablet/virtual_sensor_tablet_thermal.c
+@@ -709,7 +709,6 @@ static int virtual_sensor_thermal_notify(struct thermal_zone_device *thermal,
+ {
+ 	char data[20];
+ 	char *envp[] = { data, NULL };
+-	int trip_temp;
+ 
+ 	if (!thermal) {
+ 		pr_err("%s thermal:%p is NULL!\n", __func__, thermal);
+@@ -721,6 +720,8 @@ static int virtual_sensor_thermal_notify(struct thermal_zone_device *thermal,
+ 
+ #if defined(CONFIG_AMAZON_SIGN_OF_LIFE) || defined(CONFIG_AMZN_SIGN_OF_LIFE)
+ 	if (type == THERMAL_TRIP_CRITICAL) {
++		int trip_temp;
++
+ 		virtual_sensor_thermal_get_trip_temp(thermal, trip, &trip_temp);
+ 		pr_err("[%s][%s]type:[%s] Thermal shutdown virtual sensor, current temp=%d, trip=%d, trip_temp=%d\n",
+ 			__func__, dev_name(&thermal->device), thermal->type,
+diff --git a/include/linux/thermal_framework.h b/include/linux/thermal_framework.h
+index 66c74cb56fa..d459585162b 100644
+--- a/include/linux/thermal_framework.h
++++ b/include/linux/thermal_framework.h
+@@ -284,7 +284,11 @@ extern int thermal_level_compare(struct mtk_cooler_platform_data *cooler_data,
+ 		struct cooler_sort_list *head, bool positive_seq);
+ #endif
+ 
++#ifdef CONFIG_THERMAL_SHUTDOWN_LAST_KMESG
+ void last_kmsg_thermal_shutdown(void);
++#else
++static inline void last_kmsg_thermal_shutdown(void) {}
++#endif
+ 
+ /**
+  * API to register a temperature sensor with a thermal zone
+diff --git a/tools/testing/selftests/mediatek/check_sensor_suspend.py b/tools/testing/selftests/mediatek/check_sensor_suspend.py
+new file mode 100755
+index 00000000000..9bd15dec0fc
+--- /dev/null
++++ b/tools/testing/selftests/mediatek/check_sensor_suspend.py
+@@ -0,0 +1,70 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: GPL-2.0
++"""Exercise the candidate kernel's actual sensor suspend function on the host."""
++import pathlib
++import subprocess
++import sys
++import tempfile
++
++root = pathlib.Path(sys.argv[1])
++driver = sys.argv[2] if len(sys.argv) > 2 else "ltrx"
++assert driver in ("ltrx", "stk")
++folder, suspend, resume = (
++    ("ltrx130a_dual", "ltrx130a_i2c_suspend", "ltrx130a_i2c_resume")
++    if driver == "ltrx" else ("stk3x1x_dual", "stk3x1x_suspend", "stk3x1x_resume")
++)
++source = (root / "drivers/misc/mediatek/sensors-1.0/alsps" / folder / (folder + ".c")).read_text()
++start = source.index("static int " + suspend + "(struct device *dev)\n{")
++end = source.index("\nstatic int " + resume + "(", start)
++function = source[start:end]
++prefix = r"""
++#include <assert.h>
++#include <errno.h>
++#include <stddef.h>
++struct device { int unused; };
++struct i2c_client { int index; };
++struct sensor { struct i2c_client *client; };
++static struct { int als_suspend, als_count; struct sensor *als[2]; } ltrx130a_dual;
++static int paused, calls, results[2];
++#define APS_FUN() ((void)0)
++#define APS_ERR(...) ((void)0)
++#define atomic_read(p) (*(p))
++#define atomic_set(p, v) (*(p) = (v))
++static void alsps_driver_pause_polling(int value) { paused = value; }
++static int ltrx130a_als_enable(struct i2c_client *client, int enabled) {
++    (void)enabled; ++calls; return results[client->index];
++}
++"""
++cases = r"""
++int main(void) {
++    struct i2c_client clients[] = {{0}, {1}};
++    struct sensor sensors[] = {{&clients[0]}, {&clients[1]}};
++    ltrx130a_dual.als_count = 2;
++    ltrx130a_dual.als[0] = &sensors[0];
++    ltrx130a_dual.als[1] = &sensors[1];
++    results[0] = -EIO;
++    assert(ltrx130a_i2c_suspend(NULL) == -EIO);
++    assert(calls == 1 && !paused && !ltrx130a_dual.als_suspend);
++    results[0] = 0; calls = 0;
++    assert(ltrx130a_i2c_suspend(NULL) == 0);
++    assert(calls == 2 && paused && ltrx130a_dual.als_suspend);
++    assert(ltrx130a_i2c_suspend(NULL) == 0 && calls == 2);
++    ltrx130a_dual.als_suspend = 0; calls = 0; results[1] = -EINVAL;
++    assert(ltrx130a_i2c_suspend(NULL) == -EINVAL);
++    assert(calls == 2 && !paused && !ltrx130a_dual.als_suspend);
++    ltrx130a_dual.als[0] = NULL; calls = 0;
++    assert(ltrx130a_i2c_suspend(NULL) == -EINVAL);
++    assert(!calls && !paused && !ltrx130a_dual.als_suspend);
++    ltrx130a_dual.als_count = 0;
++    assert(ltrx130a_i2c_suspend(NULL) == 0);
++    return 0;
++}
++"""
++if driver == "stk":
++    prefix += "\n#define stk3x1x_dual ltrx130a_dual\n#define stk3x1x_enable_als ltrx130a_als_enable\n#define stk3x1x_suspend ltrx130a_i2c_suspend\n"
++with tempfile.TemporaryDirectory(prefix="trona-suspend-") as temporary:
++    path = pathlib.Path(temporary)
++    (path / "check.c").write_text(prefix + function + cases)
++    subprocess.run(["gcc", "-std=c99", "-O0", str(path / "check.c"), "-o", str(path / "check")], check=True)
++    subprocess.run([str(path / "check")], check=True, cwd=path)
++print("PASS:", driver, "suspend propagates errors and restores polling state")
+-- 
+2.53.0
+

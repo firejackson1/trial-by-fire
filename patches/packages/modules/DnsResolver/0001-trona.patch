@@ -1,0 +1,26 @@
+diff --git a/DnsProxyListener.cpp b/DnsProxyListener.cpp
+index f55d2c5..4b18f64 100644
+--- a/DnsProxyListener.cpp
++++ b/DnsProxyListener.cpp
+@@ -35,6 +35,7 @@
+ #include <vector>
+ 
+ #include <android-base/parseint.h>
++#include <android-base/properties.h>
+ #include <android/multinetwork.h>  // ResNsendFlags
+ #include <cutils/misc.h>           // FIRST_APPLICATION_UID
+ #include <cutils/multiuser.h>
+@@ -717,7 +718,12 @@ DnsProxyListener::DnsProxyListener() : FrameworkListener(SOCKET_NAME) {
+     mGetDnsNetIdCommand = std::make_unique<GetDnsNetIdCommand>();
+     registerCmd(mGetDnsNetIdCommand.get());
+ 
+-    if (ADnsHelper_init()) abort();
++    // The trona legacy network backend has no BPF maps. Without them the helper
++    // reports errors, which isUidNetworkingBlocked() treats as not blocked.
++    if (ADnsHelper_init() != 0 &&
++        android::base::GetProperty("ro.trona.network_backend", "") != "legacy") {
++        abort();
++    }
+ }
+ 
+ void DnsProxyListener::Handler::spawn() {

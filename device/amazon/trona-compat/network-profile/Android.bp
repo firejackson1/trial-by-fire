@@ -1,0 +1,21 @@
+// SPDX-License-Identifier: Apache-2.0
+cc_library_static {
+    name: "libtrona_network_profile",
+    visibility: [
+        "//system/netd/server:__pkg__",
+        "//packages/modules/Connectivity/service:__pkg__",
+    ],
+    srcs: ["NativeNetworkProfile.cpp"],
+    export_include_dirs: ["include"],
+    shared_libs: ["libbase"],
+    cflags: [
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+    ],
+    min_sdk_version: "30",
+    apex_available: [
+        "//apex_available:platform",
+        "com.android.tethering",
+    ],
+}

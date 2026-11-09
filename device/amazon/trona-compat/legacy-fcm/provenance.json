@@ -1,0 +1,98 @@
+[
+  {
+    "path": "android-4.4/Android.bp",
+    "source": "https://android.googlesource.com/kernel/configs/+/refs/tags/android-11.0.0_r48/p/android-4.4/Android.bp",
+    "sha256": "6654c5848228965e4ec9f9fb27f44c7132f2963b8c765d552800e5e773490e17",
+    "bytes": 828
+  },
+  {
+    "path": "android-4.4/android-base.config",
+    "source": "https://android.googlesource.com/kernel/configs/+/refs/tags/android-11.0.0_r48/p/android-4.4/android-base.config",
+    "sha256": "086064143a0b858268775d9f25692a710a7fa2ccf4cff4effa0c9462566b12fc",
+    "bytes": 4677
+  },
+  {
+    "path": "android-4.4/android-base-arm.config",
+    "source": "https://android.googlesource.com/kernel/configs/+/refs/tags/android-11.0.0_r48/p/android-4.4/android-base-arm.config",
+    "sha256": "d41fbc0214bf03074f0dd23f09233efcbb36916f0bb371dc6b5903da441e5c42",
+    "bytes": 32
+  },
+  {
+    "path": "android-4.4/android-base-arm64.config",
+    "source": "https://android.googlesource.com/kernel/configs/+/refs/tags/android-11.0.0_r48/p/android-4.4/android-base-arm64.config",
+    "sha256": "6ba4f4bb1e496e0444b9b10fd352e0a73ea3bc0ed7d84cb24b0b17b052dfab95",
+    "bytes": 137
+  },
+  {
+    "path": "android-4.4/android-base-conditional.xml",
+    "source": "https://android.googlesource.com/kernel/configs/+/refs/tags/android-11.0.0_r48/p/android-4.4/android-base-conditional.xml",
+    "sha256": "60a73c3d840047031e4cecba3627a5748680560a371bceaef30374bc1d53be48",
+    "bytes": 28
+  },
+  {
+    "path": "android-4.9/Android.bp",
+    "source": "https://android.googlesource.com/kernel/configs/+/refs/tags/android-11.0.0_r48/p/android-4.9/Android.bp",
+    "sha256": "8af41e4f4179a329b910b8929f967047749739b3d9c4f9454b30183cd4db60a7",
+    "bytes": 828
+  },
+  {
+    "path": "android-4.9/android-base.config",
+    "source": "https://android.googlesource.com/kernel/configs/+/refs/tags/android-11.0.0_r48/p/android-4.9/android-base.config",
+    "sha256": "4060ce3beeb85ce69fb1b6904efba0c02cd00817fadfe9656be279761e58f874",
+    "bytes": 4690
+  },
+  {
+    "path": "android-4.9/android-base-arm.config",
+    "source": "https://android.googlesource.com/kernel/configs/+/refs/tags/android-11.0.0_r48/p/android-4.9/android-base-arm.config",
+    "sha256": "d41fbc0214bf03074f0dd23f09233efcbb36916f0bb371dc6b5903da441e5c42",
+    "bytes": 32
+  },
+  {
+    "path": "android-4.9/android-base-arm64.config",
+    "source": "https://android.googlesource.com/kernel/configs/+/refs/tags/android-11.0.0_r48/p/android-4.9/android-base-arm64.config",
+    "sha256": "6ba4f4bb1e496e0444b9b10fd352e0a73ea3bc0ed7d84cb24b0b17b052dfab95",
+    "bytes": 137
+  },
+  {
+    "path": "android-4.9/android-base-conditional.xml",
+    "source": "https://android.googlesource.com/kernel/configs/+/refs/tags/android-11.0.0_r48/p/android-4.9/android-base-conditional.xml",
+    "sha256": "722cf4fa5201f876d2879e1e179d79b973c11b5b7d66d824898456e8ec56f7a2",
+    "bytes": 691
+  },
+  {
+    "path": "android-4.14/Android.bp",
+    "source": "https://android.googlesource.com/kernel/configs/+/refs/tags/android-11.0.0_r48/p/android-4.14/Android.bp",
+    "sha256": "b24bcb19dfe5e725bbbbf2e80343da6b7404558e2c12f169ac01c5dd66139a24",
+    "bytes": 829
+  },
+  {
+    "path": "android-4.14/android-base.config",
+    "source": "https://android.googlesource.com/kernel/configs/+/refs/tags/android-11.0.0_r48/p/android-4.14/android-base.config",
+    "sha256": "9c99cdb0bbb58b7251d723e15f6d22a5d2476809d915ab64c589fa935941152e",
+    "bytes": 4739
+  },
+  {
+    "path": "android-4.14/android-base-arm.config",
+    "source": "https://android.googlesource.com/kernel/configs/+/refs/tags/android-11.0.0_r48/p/android-4.14/android-base-arm.config",
+    "sha256": "dab2fd24afcd33fec3135a9f27271614f9ccd86f313f82bb6e14d76bd9b7dc00",
+    "bytes": 62
+  },
+  {
+    "path": "android-4.14/android-base-arm64.config",
+    "source": "https://android.googlesource.com/kernel/configs/+/refs/tags/android-11.0.0_r48/p/android-4.14/android-base-arm64.config",
+    "sha256": "6ba4f4bb1e496e0444b9b10fd352e0a73ea3bc0ed7d84cb24b0b17b052dfab95",
+    "bytes": 137
+  },
+  {
+    "path": "android-4.14/android-base-conditional.xml",
+    "source": "https://android.googlesource.com/kernel/configs/+/refs/tags/android-11.0.0_r48/p/android-4.14/android-base-conditional.xml",
+    "sha256": "471a5c0e13b00ce642a95f95716bea711536fbc61ef186cfb56e55c6c1664726",
+    "bytes": 692
+  },
+  {
+    "path": "compatibility_matrix.3.xml",
+    "source": "https://raw.githubusercontent.com/LineageOS/android_hardware_interfaces/203e87a39c04f30bc1f09f6c2306b701d6b97fe0/compatibility_matrices/compatibility_matrix.3.xml",
+    "sha256": "02350d54c7345e61ca4ca2279bdf26aaa524a20220c7ec042e8dc57b3db80743",
+    "bytes": 14931
+  }
+]

@@ -1,0 +1,9 @@
+# Trona system-server access to the retained qtaguid kernel interface.
+allow system_server proc_qtaguid_ctrl:file { getattr open write };
+allow system_server qtaguid_device:chr_file { getattr open read };
+
+# The authenticated daemon route keeps kernel control access out of app domains.
+# Parent directory traversal and the exact tracker/control operations only.
+allow netd proc_qtaguid_stat:dir search;
+allow netd proc_qtaguid_ctrl:file { getattr open write };
+allow netd qtaguid_device:chr_file { getattr open read };

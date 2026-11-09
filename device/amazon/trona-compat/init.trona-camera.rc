@@ -1,0 +1,6 @@
+# trona: the retained vendor libcameracustom.so embeds DEFAULT_STEREO_SETTING JSON with a
+# trailing comma. Android 11 recovered from the resulting parse_error; Android 17 cannot,
+# because the vendor's libgcc unwinder context reaches bionic's LLVM unwinder. The shipped
+# copy differs from the vendor file by one byte (',' -> ' ' at file offset 0x5b193).
+on post-fs
+    mount none /system/etc/trona/libcameracustom.trona-json-fix.bin /vendor/lib64/libcameracustom.so bind

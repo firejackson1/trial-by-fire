@@ -1,0 +1,6 @@
+# Immutable Trona network backend choice; product leaves it unset until complete.
+ro.trona.network_backend u:object_r:build_prop:s0 exact enum modern legacy
+
+# Native-core readiness is separate from both immutable selection and BPF state.
+sys.trona.netd_ready u:object_r:trona_netd_ready_prop:s0 exact string
+sys.trona.netd_generation u:object_r:trona_netd_generation_prop:s0 exact uint

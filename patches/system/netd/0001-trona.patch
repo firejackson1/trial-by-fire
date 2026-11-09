@@ -1,0 +1,3873 @@
+diff --git a/client/LegacyQtaguidClient.cpp b/client/LegacyQtaguidClient.cpp
+new file mode 100644
+index 0000000..a1e9de8
+--- /dev/null
++++ b/client/LegacyQtaguidClient.cpp
+@@ -0,0 +1,95 @@
++// SPDX-License-Identifier: Apache-2.0
++#include "LegacyQtaguidClient.h"
++
++#include <cerrno>
++#include <cinttypes>
++#include <cstdio>
++#include <fcntl.h>
++#include <pthread.h>
++#include <unistd.h>
++
++#ifndef TRONA_QTAGUID_TRACK_PATH
++#define TRONA_QTAGUID_TRACK_PATH "/dev/xt_qtaguid"
++#endif
++#ifndef TRONA_QTAGUID_CTRL_PATH
++#define TRONA_QTAGUID_CTRL_PATH "/proc/net/xt_qtaguid/ctrl"
++#endif
++
++namespace trona::network {
++namespace {
++pthread_mutex_t trackerMutex = PTHREAD_MUTEX_INITIALIZER;
++pthread_once_t forkRegistration = PTHREAD_ONCE_INIT;
++int trackerFd = -1;
++int forkRegistrationError = 0;
++
++void beforeFork() { pthread_mutex_lock(&trackerMutex); }
++void afterParentFork() { pthread_mutex_unlock(&trackerMutex); }
++void afterChildFork() {
++    // A child must not use the parent's tracking file description. Its first tag
++    // opens a tracker owned by the child's process.
++    if (trackerFd >= 0) close(trackerFd);
++    trackerFd = -1;
++    pthread_mutex_unlock(&trackerMutex);
++}
++void registerForkHandlers() {
++    forkRegistrationError = pthread_atfork(beforeFork, afterParentFork, afterChildFork);
++}
++
++int ensureTracked() {
++    int result = pthread_once(&forkRegistration, registerForkHandlers);
++    if (result != 0) return -result;
++    if (forkRegistrationError != 0) return -forkRegistrationError;
++    result = pthread_mutex_lock(&trackerMutex);
++    if (result != 0) return -result;
++    if (trackerFd < 0) {
++        do {
++            trackerFd = open(TRONA_QTAGUID_TRACK_PATH, O_RDONLY | O_CLOEXEC);
++        } while (trackerFd < 0 && errno == EINTR);
++        if (trackerFd < 0) result = -errno;
++    }
++    const int unlock = pthread_mutex_unlock(&trackerMutex);
++    if (result == 0 && unlock != 0) result = -unlock;
++    return result;
++}
++
++int writeControl(const char* command, size_t size) {
++    int fd;
++    do {
++        fd = open(TRONA_QTAGUID_CTRL_PATH, O_WRONLY | O_CLOEXEC);
++    } while (fd < 0 && errno == EINTR);
++    if (fd < 0) return -errno;
++    ssize_t written;
++    do {
++        written = write(fd, command, size);
++    } while (written < 0 && errno == EINTR);
++    // A proc command is one transaction. A partial write cannot be retried as a suffix.
++    const int error = written < 0 ? errno : (static_cast<size_t>(written) == size ? 0 : EIO);
++    close(fd);
++    return -error;
++}
++}
++
++int tagSocketFromClient(int socketFd, uint32_t tag, uid_t uid) {
++    if (socketFd < 0) return -EBADF;
++    const int tracked = ensureTracked();
++    if (tracked != 0) return tracked;
++    char command[96];
++    const auto rawTag = static_cast<uint64_t>(tag) << 32;
++    // -1 means the caller's UID. Omitting the UID lets the kernel use
++    // current_fsuid; formatting -1 as an unsigned UID would fail permission checks.
++    const int size = uid == static_cast<uid_t>(-1)
++            ? snprintf(command, sizeof(command), "t %d %" PRIu64, socketFd, rawTag)
++            : snprintf(command, sizeof(command), "t %d %" PRIu64 " %u", socketFd,
++                       rawTag, uid);
++    if (size < 0 || static_cast<size_t>(size) >= sizeof(command)) return -EOVERFLOW;
++    return writeControl(command, static_cast<size_t>(size));
++}
++
++int untagSocketFromClient(int socketFd) {
++    if (socketFd < 0) return -EBADF;
++    char command[32];
++    const int size = snprintf(command, sizeof(command), "u %d", socketFd);
++    if (size < 0 || static_cast<size_t>(size) >= sizeof(command)) return -EOVERFLOW;
++    return writeControl(command, static_cast<size_t>(size));
++}
++}
+diff --git a/client/LegacyQtaguidClient.h b/client/LegacyQtaguidClient.h
+new file mode 100644
+index 0000000..ae0ab27
+--- /dev/null
++++ b/client/LegacyQtaguidClient.h
+@@ -0,0 +1,11 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++
++#include <cstdint>
++#include <sys/types.h>
++
++namespace trona::network {
++// Return 0 on a complete kernel control write, otherwise a negative errno.
++int tagSocketFromClient(int socketFd, uint32_t tag, uid_t uid);
++int untagSocketFromClient(int socketFd);
++}
+diff --git a/server/Android.bp b/server/Android.bp
+index 44dc816..62ce82b 100644
+--- a/server/Android.bp
++++ b/server/Android.bp
+@@ -15,9 +15,18 @@ aidl_interface {
+     // These interfaces must never be versioned or OEMs will not be able to change them.
+     name: "oemnetd_aidl_interface",
+     unstable: true,
++    backend: {
++        java: {
++            sdk_version: "system_current",
++            min_sdk_version: "31",
++            apex_available: ["//apex_available:platform", "com.android.tethering"],
++        },
++    },
+     local_include_dir: "binder",
+     srcs: [
+         "binder/com/android/internal/net/IOemNetd.aidl",
++        "binder/com/android/internal/net/TronaUidChain.aidl",
++        "binder/com/android/internal/net/TronaUidBlockedStatus.aidl",
+         "binder/com/android/internal/net/IOemNetdUnsolicitedEventListener.aidl",
+     ],
+ }
+@@ -48,6 +57,11 @@ cc_library_static {
+     ],
+     srcs: [
+         "BandwidthController.cpp",
++        "trona/LegacyFirewallRules.cpp",
++        "trona/UidRuleController.cpp",
++        "trona/MeteredUidController.cpp",
++        "trona/MeteredUidPolicy.cpp",
++        "trona/NetdRestoreAdapter.cpp",
+         "Controllers.cpp",
+         "NetdConstants.cpp",
+         "FirewallController.cpp",
+@@ -76,7 +90,9 @@ cc_library_static {
+         "libsysutils",
+         "netd_event_listener_interface-V1-cpp",
+     ],
++    export_static_lib_headers: ["libtrona_network_profile"],
+     static_libs: [
++        "libtrona_network_profile",
+         "libip_checksum",
+         "libtcutils",
+         "android.net.platform.flags-aconfig-cc",
+@@ -96,6 +112,7 @@ cc_defaults {
+     include_dirs: [
+         "system/netd/include",
+     ],
++    local_include_dirs: ["trona/tag-auth"],
+     shared_libs: [
+         "android.system.net.netd@1.0",
+         "android.system.net.netd@1.1",
+@@ -122,6 +139,7 @@ cc_defaults {
+         "libaconfig_storage_read_api_cc",
+     ],
+     static_libs: [
++        "libtrona_network_profile",
+         "libip_checksum",
+         "libnetd_server",
+         "libtcutils",
+@@ -131,6 +149,12 @@ cc_defaults {
+         "DummyNetwork.cpp",
+         "EventReporter.cpp",
+         "FwmarkServer.cpp",
++        "trona/tag-auth/LegacyTagDispatcher.cpp",
++        "trona/tag-auth/SocketClientTagCompletion.cpp",
++        "trona/tag-auth/LegacyNativeTagAdapters.cpp",
++        "trona/tag-auth/LegacySocketTagger.cpp",
++        "trona/tag-auth/LegacyTagPermissionOracle.cpp",
++        "trona/tag-auth/client/LegacyQtaguidClient.cpp",
+         "LocalNetwork.cpp",
+         "MDnsService.cpp",
+         "NetdCommand.cpp",
+@@ -166,6 +190,9 @@ cc_binary {
+     ],
+     srcs: [
+         "main.cpp",
++        "trona/RetainedNetworkPrerequisites.cpp",
++        "trona/RetainedNetworkPrerequisitesIo.cpp",
++        "trona/LegacyQtaguidStats.cpp",
+     ],
+     sanitize: {
+         cfi: true,
+diff --git a/server/BandwidthController.cpp b/server/BandwidthController.cpp
+index 8a96738..6e5c4bf 100644
+--- a/server/BandwidthController.cpp
++++ b/server/BandwidthController.cpp
+@@ -23,6 +23,8 @@
+  */
+ 
+ #include <ctype.h>
++#include <algorithm>
++#include <sstream>
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <inttypes.h>
+@@ -200,7 +202,7 @@ static const uint32_t uidBillingMask = Fwmark::getUidBillingMask();
+  * See go/ipsec-data-accounting for more information.
+  */
+ 
+-std::vector<std::string> getBasicAccountingCommands() {
++std::vector<std::string> getBasicAccountingCommands(bool useBpf) {
+     // clang-format off
+     std::vector<std::string> ipt_basic_accounting_commands = {
+             "*filter",
+@@ -210,14 +212,21 @@ std::vector<std::string> getBasicAccountingCommands() {
+             "-A bw_INPUT -p esp -j RETURN",
+             StringPrintf("-A bw_INPUT -m mark --mark 0x%x/0x%x -j RETURN", uidBillingMask,
+                          uidBillingMask),
++            useBpf ? "" : "-A bw_INPUT -m owner --socket-exists",
+             StringPrintf("-A bw_INPUT -j MARK --or-mark 0x%x", uidBillingMask),
+             "-A bw_OUTPUT -j bw_global_alert",
+-            "-A bw_costly_shared -j bw_penalty_box",
+-            ("-I bw_penalty_box -m bpf --object-pinned " XT_BPF_DENYLIST_PROG_PATH " -j REJECT"),
+-            "-A bw_penalty_box -j bw_happy_box",
+-            "-A bw_happy_box -j bw_data_saver",
++            useBpf ? "" : "-A bw_OUTPUT -o " IPSEC_IFACE_PREFIX "+ -j RETURN",
++            useBpf ? "" : "-A bw_OUTPUT -m policy --pol ipsec --dir out -j RETURN",
++            useBpf ? "" : "-A bw_OUTPUT -m owner --uid-owner clat -j RETURN",
++            useBpf ? "" : "-A bw_OUTPUT -m owner --socket-exists",
++            useBpf ? "-A bw_costly_shared -j bw_penalty_box" : "-A bw_costly_shared -j tr_metered",
++            useBpf ? ("-I bw_penalty_box -m bpf --object-pinned "
++                      XT_BPF_DENYLIST_PROG_PATH " -j REJECT") : "",
++            useBpf ? "-A bw_penalty_box -j bw_happy_box" : "",
++            useBpf ? "-A bw_happy_box -j bw_data_saver" : "",
+             "-A bw_data_saver -j RETURN",
+-            ("-I bw_happy_box -m bpf --object-pinned " XT_BPF_ALLOWLIST_PROG_PATH " -j RETURN"),
++            useBpf ? ("-I bw_happy_box -m bpf --object-pinned "
++                      XT_BPF_ALLOWLIST_PROG_PATH " -j RETURN") : "",
+             "COMMIT",
+ 
+             "*raw",
+@@ -236,7 +245,9 @@ std::vector<std::string> getBasicAccountingCommands() {
+             //
+             // Hence we will never double count and additional corrections are not needed.
+             // We can simply take the sum of base and stacked (+20B/pkt) interface counts.
+-            ("-A bw_raw_PREROUTING -m bpf --object-pinned " XT_BPF_INGRESS_PROG_PATH),
++            useBpf ? ("-A bw_raw_PREROUTING -m bpf --object-pinned "
++                      XT_BPF_INGRESS_PROG_PATH)
++                   : "-A bw_raw_PREROUTING -m owner --socket-exists",
+             "COMMIT",
+ 
+             "*mangle",
+@@ -246,32 +257,116 @@ std::vector<std::string> getBasicAccountingCommands() {
+             "-A bw_mangle_POSTROUTING -m policy --pol ipsec --dir out -j RETURN",
+             // Clear the uid billing done (egress) mark before sending this packet
+             StringPrintf("-A bw_mangle_POSTROUTING -j MARK --set-mark 0x0/0x%x", uidBillingMask),
++            useBpf ? "" : "-A bw_mangle_POSTROUTING -m owner --uid-owner clat -j RETURN",
+             // This is egress interface accounting: we account 464xlat traffic only on
+             // the clat interface (as offloaded packets never hit base interface's ip6tables)
+             // and later sum base and stacked with overhead (+20B/pkt) in higher layers
+-            ("-A bw_mangle_POSTROUTING -m bpf --object-pinned " XT_BPF_EGRESS_PROG_PATH),
++            useBpf ? ("-A bw_mangle_POSTROUTING -m bpf --object-pinned "
++                      XT_BPF_EGRESS_PROG_PATH)
++                   : "-A bw_mangle_POSTROUTING -m owner --socket-exists",
+             COMMIT_AND_CLOSE};
+     // clang-format on
++    ipt_basic_accounting_commands.erase(
++            std::remove(ipt_basic_accounting_commands.begin(),
++                        ipt_basic_accounting_commands.end(), ""),
++            ipt_basic_accounting_commands.end());
+     return ipt_basic_accounting_commands;
+ }
+ 
+ }  // namespace
+ 
+-BandwidthController::BandwidthController() {
++BandwidthController::BandwidthController(bool useBpf) : mUseBpf(useBpf) {
+ }
+ 
+-void BandwidthController::flushCleanTables(bool doClean) {
++// Parse only the filter -S inventory needed for this controller's reserved
++// bw_costly_<interface> namespace. Gather both families before any mutation.
++int BandwidthController::parseLegacyCostlyTables(const std::string& ruleList,
++        std::set<std::string>* chains) {
++    if (!chains) return -EINVAL;
++    std::set<std::string> policies, declarations, costly;
++    const auto parseRecord = [&](const std::string& line) {
++        std::istringstream words(line);
++        std::string op, name, value, extra;
++        if (!(words >> op)) return 0;
++        if (!(words >> name)) return -EINVAL;
++        if (op == "-P") {
++            if ((name != "INPUT" && name != "FORWARD" && name != "OUTPUT")
++                    || !(words >> value) || (value != "ACCEPT" && value != "DROP")
++                    || (words >> extra) || !policies.insert(name).second) return -EINVAL;
++        } else if (op == "-N") {
++            if ((words >> extra) || !declarations.insert(name).second) return -EINVAL;
++            if (!StartsWith(name, "bw_costly_") || name == "bw_costly_shared") return 0;
++            if (!isIfaceName(name.substr(std::string("bw_costly_").size()))) return -EINVAL;
++            costly.insert(name);
++        } else if (op != "-A") {
++            return -EINVAL;
++        }
++        return 0;
++    };
++    // Same logical-record boundary as Controllers::parseChildChains: -A rules
++    // are opaque, including quoted comments with literal newlines and fake headers.
++    std::string record;
++    bool quoted = false, escaped = false;
++    for (const char byte : ruleList) {
++        if (byte == '\0') return -EINVAL;
++        if (quoted) {
++            record += byte;
++            if (escaped) escaped = false;
++            else if (byte == '\\') escaped = true;
++            else if (byte == '"') quoted = false;
++            continue;
++        }
++        if (byte == '"') quoted = true;
++        if (byte != '\n') {
++            record += byte;
++            continue;
++        }
++        if (int result = parseRecord(record)) return result;
++        record.clear();
++    }
++    if (quoted || escaped || !record.empty() || policies.size() != 3) return -EINVAL;
++    chains->insert(costly.begin(), costly.end());
++    return 0;
++}
++
++int BandwidthController::flushCleanTables(bool doClean) {
++    mDataSaverEnabled.reset();
++    if (!mUseBpf) {
++        std::set<std::string> costly;
++        for (IptablesTarget target : {V4, V6}) {
++            std::string rules;
++            if (iptablesRestoreFunction(target, "*filter\n-S\nCOMMIT\n", &rules) != 0) {
++                return -EREMOTEIO;
++            }
++            if (int result = parseLegacyCostlyTables(rules, &costly)) return result;
++        }
++        // Clear owned parent references before deleting costly children. Never
++        // flush tr_metered: its acknowledged snapshot belongs to its controller.
++        if (iptablesRestoreFunction(V4V6, Join(IPT_FLUSH_COMMANDS, '\n'), nullptr) != 0) {
++            return -EREMOTEIO;
++        }
++        if (costly.empty()) return 0;
++        std::vector<std::string> commands = {"*filter"};
++        for (const auto& chain : costly) {
++            commands.push_back(StringPrintf(":%s -", chain.c_str()));
++            if (doClean) commands.push_back(StringPrintf("-X %s", chain.c_str()));
++        }
++        commands.push_back("COMMIT\n");
++        return iptablesRestoreFunction(V4V6, Join(commands, '\n'), nullptr) == 0
++                ? 0 : -EREMOTEIO;
++    }
++    // Preserve the modern best-effort order and behavior.
+     /* Flush and remove the bw_costly_<iface> tables */
+     flushExistingCostlyTables(doClean);
+ 
+     std::string commands = Join(IPT_FLUSH_COMMANDS, '\n');
+     iptablesRestoreFunction(V4V6, commands, nullptr);
++    return 0;
+ }
+ 
+ int BandwidthController::setupIptablesHooks() {
+-    /* flush+clean is allowed to fail */
+-    flushCleanTables(true);
+-    return 0;
++    // Modern cleanup remains best effort; selected legacy requires both-family ACK.
++    return flushCleanTables(true);
+ }
+ 
+ int BandwidthController::enableBandwidthControl() {
+@@ -281,10 +376,12 @@ int BandwidthController::enableBandwidthControl() {
+     mGlobalAlertBytes = 0;
+     mSharedQuotaBytes = 0;
+ 
+-    flushCleanTables(false);
++    if (int result = flushCleanTables(false)) return result;
+ 
+-    std::string commands = Join(getBasicAccountingCommands(), '\n');
+-    return iptablesRestoreFunction(V4V6, commands, nullptr);
++    std::string commands = Join(getBasicAccountingCommands(mUseBpf), '\n');
++    const int result = iptablesRestoreFunction(V4V6, commands, nullptr);
++    if (!mUseBpf && result == 0) mDataSaverEnabled = false;
++    return mUseBpf ? result : (result == 0 ? 0 : -EREMOTEIO);
+ }
+ 
+ std::string BandwidthController::makeDataSaverCommand(IptablesTarget target, bool enable) {
+@@ -303,11 +400,21 @@ std::string BandwidthController::makeDataSaverCommand(IptablesTarget target, boo
+ }
+ 
+ int BandwidthController::enableDataSaver(bool enable) {
++    mDataSaverEnabled.reset();
+     int ret = iptablesRestoreFunction(V4, makeDataSaverCommand(V4, enable), nullptr);
+     ret |= iptablesRestoreFunction(V6, makeDataSaverCommand(V6, enable), nullptr);
++    if (!mUseBpf && ret == 0) mDataSaverEnabled = enable;
+     return ret;
+ }
+ 
++int BandwidthController::getDataSaverEnabled(bool* enabled) const {
++    if (!enabled) return -EINVAL;
++    if (mUseBpf) return -EOPNOTSUPP;
++    if (!mDataSaverEnabled.has_value()) return -EAGAIN;
++    *enabled = *mDataSaverEnabled;
++    return 0;
++}
++
+ int BandwidthController::setInterfaceSharedQuota(const std::string& iface, int64_t maxBytes) {
+     int res = 0;
+     std::string quotaCmd;
+@@ -439,7 +546,7 @@ int BandwidthController::setInterfaceQuota(const std::string& iface, int64_t max
+     std::vector<std::string> cmds = {
+             "*filter",
+             StringPrintf(":%s -", chain.c_str()),
+-            StringPrintf("-A %s -j bw_penalty_box", chain.c_str()),
++            StringPrintf("-A %s -j %s", chain.c_str(), mUseBpf ? "bw_penalty_box" : "tr_metered"),
+             StringPrintf("-I bw_INPUT %d -i %s -j %s", ruleInsertPos, iface.c_str(), chain.c_str()),
+             StringPrintf("-I bw_OUTPUT %d -o %s -j %s", ruleInsertPos, iface.c_str(),
+                          chain.c_str()),
+diff --git a/server/BandwidthController.h b/server/BandwidthController.h
+index bf89eb4..a212ea8 100644
+--- a/server/BandwidthController.h
++++ b/server/BandwidthController.h
+@@ -17,6 +17,7 @@
+ #define _BANDWIDTH_CONTROLLER_H
+ 
+ #include <map>
++#include <optional>
+ #include <set>
+ #include <string>
+ #include <utility>
+@@ -29,12 +30,16 @@ class BandwidthController {
+ public:
+     std::mutex lock;
+ 
+-    BandwidthController();
++    // Startup-owned mode; ordinary construction remains modern. No runtime setter.
++    explicit BandwidthController(bool useBpf = true);
+ 
+     int setupIptablesHooks();
+ 
+     int enableBandwidthControl();
+     int enableDataSaver(bool enable);
++    // Legacy ACK state only. Caller holds lock, as for the mutating methods;
++    // startup may call before listeners exist. Errors leave output untouched.
++    int getDataSaverEnabled(bool* enabled) const;
+ 
+     int setInterfaceSharedQuota(const std::string& iface, int64_t bytes);
+     int getInterfaceSharedQuota(int64_t *bytes);
+@@ -107,7 +112,13 @@ public:
+      * If doClean then remove them also.
+      * Deals with both ip4 and ip6 tables.
+      */
+-    void flushCleanTables(bool doClean);
++    int flushCleanTables(bool doClean);
++    static int parseLegacyCostlyTables(const std::string& ruleList,
++                                      std::set<std::string>* chains);
++    const bool mUseBpf;
++    // Unknown before startup and after any attempted cleanup/partial restore.
++    // Exclusive ownership of bw_data_saver is required, as for native policy.
++    std::optional<bool> mDataSaverEnabled;
+ 
+     // For testing.
+     friend class BandwidthControllerTest;
+diff --git a/server/Controllers.cpp b/server/Controllers.cpp
+index 8a2c3be..421b2a3 100644
+--- a/server/Controllers.cpp
++++ b/server/Controllers.cpp
+@@ -14,6 +14,7 @@
+  * limitations under the License.
+  */
+ 
++#include <algorithm>
+ #include <cinttypes>
+ #include <regex>
+ #include <set>
+@@ -33,6 +34,7 @@
+ #include "RouteController.h"
+ #include "XfrmController.h"
+ #include "oem_iptables_hook.h"
++#include "trona/NetdRestoreAdapter.h"
+ 
+ namespace android {
+ namespace net {
+@@ -44,6 +46,11 @@ using android::netdutils::Stopwatch;
+ 
+ auto Controllers::execIptablesRestore  = ::execIptablesRestore;
+ auto Controllers::execIptablesRestoreWithOutput = ::execIptablesRestoreWithOutput;
++auto Controllers::execIptablesTableSnapshot = +[](
++        IptablesTarget target, const std::string& table, const std::string& parent,
++        const IptablesRestoreController::TableUpdate& prepare) {
++    return gCtls->iptablesRestoreCtrl.executeTableSnapshot(target, table, parent, prepare);
++};
+ 
+ netdutils::Log gLog("netd");
+ netdutils::Log gUnsolicitedLog("netdUnsolicited");
+@@ -121,43 +128,75 @@ static const std::regex CHILD_CHAIN_REGEX("^-A ([^ ]+) -j ([^ ]+)$",
+ }  // namespace
+ 
+ /* static */
+-std::set<std::string> Controllers::findExistingChildChains(const IptablesTarget target,
+-                                                           const char* table,
+-                                                           const char* parentChain) {
++int Controllers::findExistingChildChains(const IptablesTarget target, const char* table,
++                                         const char* parentChain,
++                                         std::set<std::string>* existing,
++                                         std::map<std::string, int>* positions) {
++    existing->clear();
++    if (positions) positions->clear();
+     if (target == V4V6) {
+         ALOGE("findExistingChildChains only supports one protocol at a time");
+         abort();
+     }
+ 
+-    std::set<std::string> existing;
+-
+-    // List the current contents of parentChain.
+-    //
+-    // TODO: there is no guarantee that nothing else modifies the chain in the few milliseconds
+-    // between when we list the existing rules and when we delete them. However:
+-    // - Since this code is only run on startup, nothing else in netd will be running.
+-    // - While vendor code is known to add its own rules to chains created by netd, it should never
+-    //   be modifying the rules in childChains or the rules that hook said chains into their parent
+-    //   chains.
++    // Read-only helper. Positional mutations use executeTableSnapshot below.
+     std::string command = StringPrintf("*%s\n-S %s\nCOMMIT\n", table, parentChain);
+     std::string output;
+-    if (Controllers::execIptablesRestoreWithOutput(target, command, &output) == -1) {
++    if (Controllers::execIptablesRestoreWithOutput(target, command, &output) != 0) {
+         ALOGE("Error listing chain %s in table %s", parentChain, table);
+-        return existing;
++        return -EREMOTEIO;
+     }
+ 
+-    // The only rules added by createChildChains are of the simple form "-A <parent> -j <child>".
+-    // Find those rules and add each one's child chain to existing.
++    return parseChildChains(output, parentChain, existing, positions);
++}
++
++/* static */
++int Controllers::parseChildChains(const std::string& listing, const char* parentChain,
++                                 std::set<std::string>* existing,
++                                 std::map<std::string, int>* positions) {
++    existing->clear();
++    if (positions) positions->clear();
++    const auto invalid = [&]() {
++        existing->clear();
++        if (positions) positions->clear();
++        return -EINVAL;
++    };
+     std::smatch matches;
+-    std::stringstream stream(output);
+     std::string rule;
+-    while (std::getline(stream, rule, '\n')) {
+-        if (std::regex_search(rule, matches, CHILD_CHAIN_REGEX) && matches[1] == parentChain) {
+-            existing.insert(matches[2]);
++    const std::string prefix = std::string("-A ") + parentChain + " ";
++    int position = 0;
++    bool quoted = false, escaped = false;
++    for (const char byte : listing) {
++        if (byte == '\0') return invalid();
++        // xtables_save_string emits double-quoted values, escaping quote,
++        // backslash and apostrophe, but leaves embedded newlines literal.
++        // Count logical rule records, not comment text on physical lines.
++        if (quoted) {
++            rule += byte;
++            if (escaped) escaped = false;
++            else if (byte == '\\') escaped = true;
++            else if (byte == '"') quoted = false;
++            continue;
++        }
++        if (byte == '"') quoted = true;
++        if (byte != '\n') {
++            rule += byte;
++            continue;
+         }
++        if (rule.compare(0, prefix.size(), prefix) == 0) ++position;
++        // Only complete plain jumps are owned anchors. A quoted conditional
++        // vendor rule is still one position, never a source of extra anchors.
++        if (std::regex_match(rule, matches, CHILD_CHAIN_REGEX) && matches[1] == parentChain) {
++            existing->insert(matches[2]);
++            if (positions && !positions->emplace(matches[2], position).second) {
++                (*positions)[matches[2]] = -1;
++            }
++        }
++        rule.clear();
+     }
+-
+-    return existing;
++    // Actual -S records terminate in newline. Do not use a truncated snapshot.
++    if (quoted || escaped || !rule.empty()) return invalid();
++    return 0;
+ }
+ 
+ /* static */
+@@ -165,7 +204,26 @@ int Controllers::createChildChains(IptablesTarget target, const char* table,
+                                    const char* parentChain,
+                                    const std::vector<const char*>& childChains,
+                                    bool exclusive) {
+-    std::string command = StringPrintf("*%s\n", table);
++    if (!exclusive) {
++        // The listing and numeric insertions share the same locked table handle.
++        return execIptablesTableSnapshot(target, table, parentChain,
++                [&](const std::string& listing, std::string* commands) {
++                    return buildChildChainCommands(parentChain, childChains, false, listing, commands);
++                });
++    }
++    std::string commands;
++    if (int result = buildChildChainCommands(parentChain, childChains, true, "", &commands)) {
++        return result;
++    }
++    return execIptablesRestore(target, StringPrintf("*%s\n", table) + commands + "COMMIT\n");
++}
++
++/* static */
++int Controllers::buildChildChainCommands(const char* parentChain,
++                                        const std::vector<const char*>& childChains, bool exclusive,
++                                        const std::string& listing, std::string* commands) {
++    commands->clear();
++    std::string command;
+ 
+     // We cannot just clear all the chains we create because vendor code modifies filter OUTPUT and
+     // mangle POSTROUTING directly. So:
+@@ -180,29 +238,66 @@ int Controllers::createChildChains(IptablesTarget target, const char* table,
+     //
+     // TODO: Make all chains exclusive once vendor code uses the oem_* rules.
+     std::set<std::string> existingChildChains;
++    std::map<std::string, int> positions;
+     if (exclusive) {
+         // Just running ":chain -" flushes user-defined chains, but not built-in chains like INPUT.
+         // Since at this point we don't know if parentChain is a built-in chain, do both.
+         StringAppendF(&command, ":%s -\n", parentChain);
+         StringAppendF(&command, "-F %s\n", parentChain);
+     } else {
+-        existingChildChains = findExistingChildChains(target, table, parentChain);
++        // A failed query is not an empty chain. Do not flush children or append
++        // duplicate hooks when we cannot establish the existing vendor-rule order.
++        if (int ret = parseChildChains(listing, parentChain, &existingChildChains, &positions)) {
++            return ret;
++        }
+     }
+ 
++    // Existing owned hooks must already follow the declared order. Never guess
++    // around duplicates or move established hooks relative to vendor rules.
++    int previous = 0;
+     for (const auto& childChain : childChains) {
++        auto found = positions.find(childChain);
++        if (found != positions.end()) {
++            if (found->second <= previous) return -EINVAL;
++            previous = found->second;
++        }
++    }
++
++    for (size_t index = 0; index < childChains.size(); ++index) {
++        const auto& childChain = childChains[index];
+         // Always clear the child chain.
+         StringAppendF(&command, ":%s -\n", childChain);
+         // But only add it to the parent chain if it's not already there.
+         if (existingChildChains.find(childChain) == existingChildChains.end()) {
+-            StringAppendF(&command, CHILD_CHAIN_TEMPLATE, parentChain, childChain);
++            // Put a new module before its next existing successor. Appending
++            // blindly can put DROP policy after bandwidth accounting on upgrades.
++            // Nonexclusive callers hold the snapshot transaction's xtables
++            // lock until these commands commit. Same-lock vendor writers wait.
++            int insertion = 0;
++            for (size_t next = index + 1; next < childChains.size(); ++next) {
++                auto successor = positions.find(childChains[next]);
++                if (successor != positions.end()) {
++                    insertion = successor->second;
++                    break;
++                }
++            }
++            if (insertion) {
++                StringAppendF(&command, "-I %s %d -j %s\n", parentChain, insertion, childChain);
++                for (auto& [name, position] : positions) {
++                    if (position >= insertion) ++position;
++                }
++            } else {
++                StringAppendF(&command, CHILD_CHAIN_TEMPLATE, parentChain, childChain);
++            }
+         }
+     }
+-    command += "COMMIT\n";
+-    return execIptablesRestore(target, command);
++    *commands = std::move(command);
++    return 0;
+ }
+ 
+-Controllers::Controllers()
+-    : wakeupCtrl(
++Controllers::Controllers(std::optional<::trona::network::OwnerAttribution> tronaAttribution)
++    : bandwidthCtrl(!tronaAttribution.has_value()),
++      wakeupCtrl(
+               [this](const WakeupController::ReportArgs& args) {
+                   const auto listener = eventReporter.getNetdEventListener();
+                   if (listener == nullptr) {
+@@ -216,11 +311,20 @@ Controllers::Controllers()
+                                           args.dstHw, srcIp, dstIp, args.srcPort, args.dstPort,
+                                           args.timestampNs);
+               },
+-              &iptablesRestoreCtrl) {
++              &iptablesRestoreCtrl),
++      mTronaAttribution(tronaAttribution),
++      mTronaUidController(tronaAttribution
++              ? std::make_shared<::trona::network::UidRuleController>(
++                        ::trona::network::RestoreViaNetd, *tronaAttribution)
++              : nullptr),
++      mTronaMeteredController(tronaAttribution
++              ? std::make_shared<::trona::network::MeteredUidController>(
++                        ::trona::network::RestoreViaNetd, *tronaAttribution)
++              : nullptr) {
+     InterfaceController::initializeAll();
+ }
+ 
+-int Controllers::initChildChains() {
++int Controllers::initChildChains(bool tronaUidPolicy) {
+     /*
+      * This is the only time we touch top-level chains in iptables; controllers
+      * should only mutate rules inside of their children chains, as created by
+@@ -231,9 +335,20 @@ int Controllers::initChildChains() {
+      * otherwise DROP/REJECT.
+      */
+ 
++    auto filterInput = FILTER_INPUT;
++    auto filterOutput = FILTER_OUTPUT;
++    if (tronaUidPolicy) {
++        // Incoming accounting remains first. Outgoing policy precedes strict and
++        // bandwidth accounting; do not place UID hooks inside fw_* (mode resets flush it).
++        filterInput.push_back("tr_uid_in");
++        const auto firewall = std::find(filterOutput.begin(), filterOutput.end(),
++                                        FirewallController::LOCAL_OUTPUT);
++        if (firewall == filterOutput.end()) return -EINVAL;
++        filterOutput.insert(firewall + 1, "tr_uid_out");
++    }
+     // Create chains for child modules.
+     int res = 0;
+-    res |= createChildChains(V4V6, "filter", "INPUT", FILTER_INPUT, true);
++    res |= createChildChains(V4V6, "filter", "INPUT", filterInput, true);
+     res |= createChildChains(V4V6, "filter", "FORWARD", FILTER_FORWARD, true);
+     res |= createChildChains(V4V6, "raw", "PREROUTING", RAW_PREROUTING, true);
+     res |= createChildChains(V4V6, "mangle", "FORWARD", MANGLE_FORWARD, true);
+@@ -242,8 +357,8 @@ int Controllers::initChildChains() {
+     res |= createChildChains(V4, "nat", "PREROUTING", NAT_PREROUTING, true);
+     res |= createChildChains(V4, "nat", "POSTROUTING", NAT_POSTROUTING, true);
+ 
+-    res |= createChildChains(V4, "filter", "OUTPUT", FILTER_OUTPUT, false);
+-    res |= createChildChains(V6, "filter", "OUTPUT", FILTER_OUTPUT, false);
++    res |= createChildChains(V4, "filter", "OUTPUT", filterOutput, false);
++    res |= createChildChains(V6, "filter", "OUTPUT", filterOutput, false);
+     res |= createChildChains(V4, "mangle", "POSTROUTING", MANGLE_POSTROUTING, false);
+     res |= createChildChains(V6, "mangle", "POSTROUTING", MANGLE_POSTROUTING, false);
+ 
+@@ -274,10 +389,44 @@ static int setupConnmarkIptablesHooks() {
+     return execIptablesRestore(V4V6, cmd);
+ }
+ 
++int Controllers::initializeTronaUidPolicy() {
++    if (!mTronaUidController) return 0;
++    // Fresh native startup matches the platform's empty disabled initial UID policy.
++    // The Java client must supply the complete active-user snapshot before policy activation.
++    std::map<int, std::vector<int>> members;
++    for (int chain = 1; chain <= 9; ++chain) members.emplace(chain, std::vector<int>{});
++    const int result = mTronaUidController->ReplayPolicy({0}, members, {});
++    if (result) return result;
++    if (!mTronaMeteredController) return -EOPNOTSUPP;
++    // bw_data_saver exists after bandwidth setup; bootstrap the owned chain
++    // before bandwidth enable installs either costly-chain path to it.
++    return mTronaMeteredController->ReplacePolicy({0}, {}, {}, {});
++}
++
++std::shared_ptr<::trona::network::UidRuleController> Controllers::getTronaUidController() const {
++    // Set once before Binder service registration; never reset/reinitialize in process.
++    return mTronaUidReady ? mTronaUidController : nullptr;
++}
++
++std::shared_ptr<::trona::network::MeteredUidController>
++Controllers::getTronaMeteredController() const {
++    // Set before Binder publication; never a claim of metered policy readiness.
++    // Startup acknowledged the empty snapshot; Java must supply full current policy.
++    return mTronaUidReady ? mTronaMeteredController : nullptr;
++}
++
+ int Controllers::initIptablesRules() {
++    if (mTronaAttribution) {
++        std::string probe;
++        // Validate the attribution gate before creating or clearing parent hooks.
++        if (int result = ::trona::network::BuildPacketDispatch(
++                ::trona::network::Direction::Ingress, {0}, {}, &probe, *mTronaAttribution)) {
++            return result;
++        }
++    }
+     Stopwatch s;
+     int res = 0;
+-    res |= initChildChains();
++    res |= initChildChains(mTronaUidController != nullptr);
+     gLog.info("Creating child chains: %" PRId64 "us", s.getTimeAndResetUs());
+ 
+     // Let each module setup their child chains
+@@ -318,10 +467,19 @@ int Controllers::initIptablesRules() {
+     res |= setupConnmarkIptablesHooks();
+     gLog.info("Setting up connmark hooks: %" PRId64 "us", s.getTimeAndResetUs());
+ 
++    // Child creation flushes dispatch; initialize policy only after all hook setup succeeds.
++    if (res == 0) res = initializeTronaUidPolicy();
+     return res;
+ }
+ 
+ void Controllers::init() {
++    if (mTronaUidController) {
++        if (mTronaInitializationStarted) {
++            gLog.error("Refusing to reset an existing Trona UID policy lifecycle");
++            exit(1);
++        }
++        mTronaInitializationStarted = true;
++    }
+     if (initIptablesRules()) {
+         gLog.error("Failed to initialize iptables rules");
+         exit(1);
+@@ -351,6 +509,7 @@ void Controllers::init() {
+         exit(4);
+     };
+     gLog.info("Initializing XfrmController: %" PRId64 "us", s.getTimeAndResetUs());
++    mTronaUidReady = mTronaUidController != nullptr && mTronaMeteredController != nullptr;
+ }
+ 
+ Controllers* gCtls = nullptr;
+diff --git a/server/Controllers.h b/server/Controllers.h
+index 301ef18..989c50c 100644
+--- a/server/Controllers.h
++++ b/server/Controllers.h
+@@ -17,6 +17,10 @@
+ #ifndef _CONTROLLERS_H__
+ #define _CONTROLLERS_H__
+ 
++#include <map>
++#include <memory>
++#include <optional>
++
+ #include "BandwidthController.h"
+ #include "EventReporter.h"
+ #include "FirewallController.h"
+@@ -30,13 +34,22 @@
+ #include "WakeupController.h"
+ #include "XfrmController.h"
+ #include "netdutils/Log.h"
++#include "trona/UidRuleController.h"
++#include "trona/MeteredUidController.h"
+ 
+ namespace android {
+ namespace net {
+ 
+ class Controllers {
+   public:
+-    Controllers();
++    // No default selector: main still constructs the modern backend. The optional
++    // argument is for an explicitly selected, fully supported future legacy path.
++    // An Unverified request fails before hook writes rather than silently falling back.
++    explicit Controllers(std::optional<::trona::network::OwnerAttribution> tronaAttribution = std::nullopt);
++    std::shared_ptr<::trona::network::UidRuleController> getTronaUidController() const;
++    // Availability after native initialization, not metered snapshot/packet readiness.
++    std::shared_ptr<::trona::network::MeteredUidController> getTronaMeteredController() const;
++
+ 
+     NetworkController netCtrl;
+     TetherController tetherCtrl;
+@@ -55,10 +68,24 @@ class Controllers {
+   private:
+     friend class ControllersTest;
+     int initIptablesRules();
+-    static int initChildChains();
+-    static std::set<std::string> findExistingChildChains(const IptablesTarget target,
+-                                                         const char* table,
+-                                                         const char* parentChain);
++    static int initChildChains(bool tronaUidPolicy = false);
++    int initializeTronaUidPolicy();
++    const std::optional<::trona::network::OwnerAttribution> mTronaAttribution;
++    const std::shared_ptr<::trona::network::UidRuleController> mTronaUidController;
++    const std::shared_ptr<::trona::network::MeteredUidController> mTronaMeteredController;
++    bool mTronaInitializationStarted = false;
++    bool mTronaUidReady = false;
++    static int findExistingChildChains(const IptablesTarget target, const char* table,
++                                       const char* parentChain, std::set<std::string>* existing,
++                                       std::map<std::string, int>* positions = nullptr);
++    static int parseChildChains(const std::string& listing, const char* parentChain,
++                                std::set<std::string>* existing,
++                                std::map<std::string, int>* positions);
++    static int buildChildChainCommands(const char* parentChain,
++                                      const std::vector<const char*>& childChains, bool exclusive,
++                                      const std::string& listing, std::string* commands);
++    static int (*execIptablesTableSnapshot)(IptablesTarget, const std::string&, const std::string&,
++                                           const IptablesRestoreController::TableUpdate&);
+     static int createChildChains(IptablesTarget target, const char* table, const char* parentChain,
+                                  const std::vector<const char*>& childChains, bool exclusive);
+     static int (*execIptablesRestore)(IptablesTarget, const std::string&);
+diff --git a/server/ControllersTest.cpp b/server/ControllersTest.cpp
+index b6a28d3..c45b950 100644
+--- a/server/ControllersTest.cpp
++++ b/server/ControllersTest.cpp
+@@ -16,6 +16,7 @@
+  * ControllersTest.cpp - unit tests for Controllers.cpp
+  */
+ 
++#include <cerrno>
+ #include <set>
+ #include <string>
+ #include <vector>
+@@ -38,15 +39,102 @@ class ControllersTest : public IptablesBaseTest {
+     ControllersTest() {
+         Controllers::execIptablesRestore = fakeExecIptablesRestore;
+         Controllers::execIptablesRestoreWithOutput = fakeExecIptablesRestoreWithOutput;
++        Controllers::execIptablesTableSnapshot = fakeTableSnapshot;
+     }
+ 
+   protected:
++    static int fakeTableSnapshot(IptablesTarget target, const std::string& table,
++                                 const std::string& parent,
++                                 const IptablesRestoreController::TableUpdate& prepare) {
++        std::string listing, commands;
++        if (Controllers::execIptablesRestoreWithOutput(target,
++                "*" + table + "\n-S " + parent + "\nCOMMIT\n", &listing) != 0) {
++            return -EREMOTEIO;
++        }
++        if (int result = prepare(listing, &commands)) return result;
++        return fakeExecIptablesRestore(target, "*" + table + "\n" + commands + "COMMIT\n");
++    }
+     void initChildChains() { Controllers::initChildChains(); };
+     std::set<std::string> findExistingChildChains(IptablesTarget a, const char* b, const char*c) {
+-        return Controllers::findExistingChildChains(a, b, c);
++        std::set<std::string> existing;
++        EXPECT_EQ(0, Controllers::findExistingChildChains(a, b, c, &existing));
++        return existing;
++    }
++    int createOutputChains(IptablesTarget target) {
++        return Controllers::createChildChains(target, "filter", "OUTPUT", {"fw_OUTPUT"}, false);
++    }
++    int createOrderedOutputChains(IptablesTarget target) {
++        return Controllers::createChildChains(target, "filter", "OUTPUT",
++                {"fw_OUTPUT", "tr_uid_out", "st_OUTPUT", "bw_OUTPUT"}, false);
++    }
++    void failChainListing() {
++        Controllers::execIptablesRestoreWithOutput =
++                [](IptablesTarget target, const std::string& command, std::string* output) {
++                    fakeExecIptablesRestoreWithOutput(target, command, output);
++                    return -1;
++                };
+     }
+ };
+ 
++TEST_F(ControllersTest, TestFailedListingDoesNotMutateChains) {
++    failChainListing();
++    for (const auto target : {V4, V6}) {
++        sIptablesRestoreOutput.push_back("-A OUTPUT -j fw_OUTPUT\n");
++        EXPECT_EQ(-EREMOTEIO, createOutputChains(target));
++        ExpectedIptablesCommands expected = {{target, "*filter\n-S OUTPUT\nCOMMIT\n"}};
++        expectIptablesRestoreCommands(expected);
++    }
++}
++
++TEST_F(ControllersTest, TestMissingHookInsertedBeforeSuccessor) {
++    for (const auto target : {V4, V6}) {
++        sIptablesRestoreOutput.push_back(
++                "-A OUTPUT -j fw_OUTPUT\n-A OUTPUT -o vendor0 -j DROP\n"
++                "-A OUTPUT -j st_OUTPUT\n-A OUTPUT -j bw_OUTPUT\n");
++        EXPECT_EQ(0, createOrderedOutputChains(target));
++        ExpectedIptablesCommands expected = {
++                {target, "*filter\n-S OUTPUT\nCOMMIT\n"},
++                {target, "*filter\n:fw_OUTPUT -\n:tr_uid_out -\n"
++                         "-I OUTPUT 3 -j tr_uid_out\n:st_OUTPUT -\n:bw_OUTPUT -\nCOMMIT\n"}};
++        expectIptablesRestoreCommands(expected);
++    }
++}
++
++TEST_F(ControllersTest, TestAmbiguousOwnedHooksDoNotMutateChains) {
++    for (const auto target : {V4, V6}) {
++        for (const auto listing : {"-A OUTPUT -j fw_OUTPUT\n-A OUTPUT -j fw_OUTPUT\n",
++                                   "-A OUTPUT -j bw_OUTPUT\n-A OUTPUT -j fw_OUTPUT\n"}) {
++            sIptablesRestoreOutput.push_back(listing);
++            EXPECT_EQ(-EINVAL, createOrderedOutputChains(target));
++            ExpectedIptablesCommands expected = {{target, "*filter\n-S OUTPUT\nCOMMIT\n"}};
++            expectIptablesRestoreCommands(expected);
++        }
++    }
++}
++
++TEST_F(ControllersTest, TestQuotedMultilineVendorCommentIsOneRule) {
++    for (const auto target : {V4, V6}) {
++        sIptablesRestoreOutput.push_back(
++                "-A OUTPUT -j fw_OUTPUT\n"
++                "-A OUTPUT -m comment --comment \"vendor\n"
++                "-A OUTPUT -j tr_uid_out\nend\" -j RETURN\n"
++                "-A OUTPUT -j st_OUTPUT\n-A OUTPUT -j bw_OUTPUT\n");
++        EXPECT_EQ(0, createOrderedOutputChains(target));
++        ExpectedIptablesCommands expected = {
++                {target, "*filter\n-S OUTPUT\nCOMMIT\n"},
++                {target, "*filter\n:fw_OUTPUT -\n:tr_uid_out -\n"
++                         "-I OUTPUT 3 -j tr_uid_out\n:st_OUTPUT -\n:bw_OUTPUT -\nCOMMIT\n"}};
++        expectIptablesRestoreCommands(expected);
++    }
++}
++
++TEST_F(ControllersTest, TestTruncatedQuotedListingDoesNotMutate) {
++    sIptablesRestoreOutput.push_back("-A OUTPUT -m comment --comment \"unfinished\n");
++    EXPECT_EQ(-EINVAL, createOrderedOutputChains(V4));
++    ExpectedIptablesCommands expected = {{V4, "*filter\n-S OUTPUT\nCOMMIT\n"}};
++    expectIptablesRestoreCommands(expected);
++}
++
+ TEST_F(ControllersTest, TestFindExistingChildChains) {
+     ExpectedIptablesCommands expectedCmds = {
+         { V6, "*raw\n-S PREROUTING\nCOMMIT\n" },
+@@ -247,6 +335,12 @@ TEST_F(ControllersTest, TestInitIptablesRules) {
+     // ... and expect that when we populate the OUTPUT chain, we do not re-add them.
+     DELETE_SUBSTRING("-A OUTPUT -j oem_out\n", expected[11].second);
+     DELETE_SUBSTRING("-A OUTPUT -j st_OUTPUT\n", expected[11].second);
++    // The missing firewall hook belongs before the existing strict/accounting hooks.
++    const std::string appendFirewall = "-A OUTPUT -j fw_OUTPUT\n";
++    const size_t firewallPosition = expected[11].second.find(appendFirewall);
++    ASSERT_NE(std::string::npos, firewallPosition);
++    expected[11].second.replace(firewallPosition, appendFirewall.size(),
++                                "-I OUTPUT 2 -j fw_OUTPUT\n");
+ 
+     // 3. Now test that when we list the POSTROUTING chain in the mangle table, we find a mixture of
+     // netd-created rules and vendor rules:
+diff --git a/server/FwmarkServer.cpp b/server/FwmarkServer.cpp
+index a27c19f..588cbe9 100644
+--- a/server/FwmarkServer.cpp
++++ b/server/FwmarkServer.cpp
+@@ -15,6 +15,8 @@
+  */
+ 
+ #include "FwmarkServer.h"
++#include "SocketClientTagCompletion.h"
++#include "LegacySocketTagger.h"
+ 
+ #include <net/if.h>
+ #include <netinet/in.h>
+@@ -43,21 +45,22 @@ using android::net::metrics::INetdEventListener;
+ namespace android {
+ namespace net {
+ 
+-FwmarkServer::FwmarkServer(NetworkController* networkController, EventReporter* eventReporter)
++FwmarkServer::FwmarkServer(NetworkController* networkController, EventReporter* eventReporter,
++        std::shared_ptr<trona::network::LegacyTagDispatcher> tagDispatcher)
+     : SocketListener(SOCKET_NAME, true),
+       mNetworkController(networkController),
+-      mEventReporter(eventReporter) {}
++      mEventReporter(eventReporter),
++      mTagDispatcher(std::move(tagDispatcher)) {}
+ 
+ bool FwmarkServer::onDataAvailable(SocketClient* client) {
+     int socketFd = -1;
+-    int error = processClient(client, &socketFd);
+-    if (socketFd >= 0) {
+-        close(socketFd);
+-    }
++    bool responseHandled = false;
++    int error = processClient(client, &socketFd, &responseHandled);
++    if (socketFd >= 0) close(socketFd);
+ 
+     // Always send a response even if there were connection errors or read errors, so that we don't
+     // inadvertently cause the client to hang (which always waits for a response).
+-    client->sendData(&error, sizeof(error));
++    if (!responseHandled) client->sendData(&error, sizeof(error));
+ 
+     // Always close the client connection (by returning false). This prevents a DoS attack where
+     // the client issues multiple commands on the same connection, never reading the responses,
+@@ -78,7 +81,9 @@ static bool hasDestinationAddress(FwmarkCommand::CmdId cmdId) {
+     }
+ }
+ 
+-int FwmarkServer::processClient(SocketClient* client, int* socketFd) {
++int FwmarkServer::processClient(SocketClient* client, int* socketFd, bool* responseHandled) {
++    const pid_t peerPid = client->getPid();
++    const uid_t peerUid = client->getUid();
+     struct {
+         FwmarkCommand command;
+         FwmarkConnectInfo connectInfo;
+@@ -109,7 +114,7 @@ int FwmarkServer::processClient(SocketClient* client, int* socketFd) {
+         return -EBADMSG;
+     }
+ 
+-    Permission permission = mNetworkController->getPermissionForUser(client->getUid());
++    Permission permission = mNetworkController->getPermissionForUser(peerUid);
+ 
+     if (command.cmdId == FwmarkCommand::QUERY_USER_ACCESS) {
+         if ((permission & PERMISSION_SYSTEM) != PERMISSION_SYSTEM) {
+@@ -191,7 +196,7 @@ int FwmarkServer::processClient(SocketClient* client, int* socketFd) {
+                     fwmark.netId = mNetworkController->getNetworkForInterface(
+                             connectInfo.addr.sin6.sin6_scope_id);
+                 } else if (!fwmark.protectedFromVpn) {
+-                    fwmark.netId = mNetworkController->getNetworkForConnect(client->getUid());
++                    fwmark.netId = mNetworkController->getNetworkForConnect(peerUid);
+                 } else if (!mNetworkController->isVirtualNetwork(fwmark.netId)) {
+                     fwmark.netId = mNetworkController->getDefaultNetwork();
+                 }
+@@ -229,7 +234,7 @@ int FwmarkServer::processClient(SocketClient* client, int* socketFd) {
+                 netdEventListener->onConnectEvent(fwmark.netId, connectInfo.error,
+                         connectInfo.latencyMs,
+                         (ret == 0) ? String16(addrstr) : String16(""),
+-                        (ret == 0) ? strtoul(portstr, nullptr, 10) : 0, client->getUid());
++                        (ret == 0) ? strtoul(portstr, nullptr, 10) : 0, peerUid);
+             }
+             break;
+         }
+@@ -247,13 +252,13 @@ int FwmarkServer::processClient(SocketClient* client, int* socketFd) {
+                 fwmark.protectedFromVpn = false;
+                 permission = PERMISSION_NONE;
+             } else {
+-                if (int ret = mNetworkController->checkUserNetworkAccess(client->getUid(),
++                if (int ret = mNetworkController->checkUserNetworkAccess(peerUid,
+                                                                          command.netId)) {
+                     return ret;
+                 }
+                 fwmark.explicitlySelected = true;
+                 fwmark.protectedFromVpn =
+-                        mNetworkController->canProtect(client->getUid(), command.netId);
++                        mNetworkController->canProtect(peerUid, command.netId);
+             }
+             break;
+         }
+@@ -261,8 +266,8 @@ int FwmarkServer::processClient(SocketClient* client, int* socketFd) {
+         case FwmarkCommand::PROTECT_FROM_VPN: {
+             // TODO: Add support to specify netId in protectFromVpn(). Currently, NetdClient always
+             // passes NETID_UNSET
+-            if (!mNetworkController->canProtect(client->getUid(), fwmark.netId)) {
+-                LOG(ERROR) << "uid " << client->getUid() << " protect from VPN failed.";
++            if (!mNetworkController->canProtect(peerUid, fwmark.netId)) {
++                LOG(ERROR) << "uid " << peerUid << " protect from VPN failed.";
+                 return -EPERM;
+             }
+             // If a bypassable VPN's provider app calls connect() and then protect(), it will end up
+@@ -295,14 +300,28 @@ int FwmarkServer::processClient(SocketClient* client, int* socketFd) {
+             //  - xt_qtaguid will see -1 on the command line, fail to parse it as a uint32_t,
+             //    and fall back to current_fsuid().
+             uid_t tagUid = command.uid;
+-            if (static_cast<int>(tagUid) == -1) tagUid = client->getUid();
++            if (static_cast<int>(tagUid) == -1) tagUid = peerUid;
++            if (mTagDispatcher) {
++                auto completion = std::make_unique<trona::network::SocketClientTagCompletion>(client);
++                auto request = std::make_unique<trona::network::LegacyTagRequest>(
++                        trona::network::AuthenticatedTagPeer{peerPid, peerUid}, *socketFd,
++                        command.trafficCtrlInfo, tagUid,
++                        std::chrono::steady_clock::now()
++                                + trona::network::LegacyTagDispatcher::kMaxDelay,
++                        std::move(completion));
++                *socketFd = -1;  // Request now owns the received FD.
++                *responseHandled = true;  // Includes immediate rejection/completion.
++                (void)mTagDispatcher->submit(std::move(request));
++                return 0;
++            }
+             return libnetd_updatable_tagSocket(*socketFd, command.trafficCtrlInfo, tagUid,
+-                                               client->getUid());
++                                               peerUid);
+         }
+ 
+         case FwmarkCommand::UNTAG_SOCKET: {
+             // Any process can untag a socket it has an fd for.
+-            return libnetd_updatable_untagSocket(*socketFd);
++            return mTagDispatcher ? trona::network::UntagLegacySocket(*socketFd)
++                                  : libnetd_updatable_untagSocket(*socketFd);
+         }
+ 
+         default: {
+diff --git a/server/FwmarkServer.h b/server/FwmarkServer.h
+index 473f792..58093e7 100644
+--- a/server/FwmarkServer.h
++++ b/server/FwmarkServer.h
+@@ -17,6 +17,8 @@
+ #ifndef NETD_SERVER_FWMARK_SERVER_H
+ #define NETD_SERVER_FWMARK_SERVER_H
+ 
++#include <memory>
++#include "LegacyTagDispatcher.h"
+ #include "EventReporter.h"
+ #include "sysutils/SocketListener.h"
+ 
+@@ -27,7 +29,8 @@ class NetworkController;
+ 
+ class FwmarkServer : public SocketListener {
+ public:
+-  explicit FwmarkServer(NetworkController* networkController, EventReporter* eventReporter);
++  explicit FwmarkServer(NetworkController* networkController, EventReporter* eventReporter,
++                        std::shared_ptr<trona::network::LegacyTagDispatcher> tagDispatcher = nullptr);
+ 
+   static constexpr const char* SOCKET_NAME = "fwmarkd";
+ 
+@@ -36,10 +39,11 @@ private:
+     bool onDataAvailable(SocketClient* client);
+ 
+     // Returns 0 on success or a negative errno value on failure.
+-    int processClient(SocketClient* client, int* socketFd);
++    int processClient(SocketClient* client, int* socketFd, bool* responseHandled);
+ 
+     NetworkController* const mNetworkController;
+     EventReporter* mEventReporter;
++    const std::shared_ptr<trona::network::LegacyTagDispatcher> mTagDispatcher;
+ };
+ 
+ }  // namespace net
+diff --git a/server/IptablesRestoreController.cpp b/server/IptablesRestoreController.cpp
+index 49b48d3..79276ed 100644
+--- a/server/IptablesRestoreController.cpp
++++ b/server/IptablesRestoreController.cpp
+@@ -17,6 +17,9 @@
+ #define LOG_TAG "IptablesRestoreController"
+ #include "IptablesRestoreController.h"
+ 
++#include <cerrno>
++#include <cstdio>
++#include <cstdlib>
+ #include <poll.h>
+ #include <signal.h>
+ #include <sys/wait.h>
+@@ -36,9 +39,17 @@ using android::netdutils::sSyscalls;
+ constexpr char IPTABLES_RESTORE_PATH[] = "/system/bin/iptables-restore";
+ constexpr char IP6TABLES_RESTORE_PATH[] = "/system/bin/ip6tables-restore";
+ 
+-constexpr char PING[] = "#PING\n";
+-
+-constexpr size_t PING_SIZE = sizeof(PING) - 1;
++static std::string makePing() {
++    // Listings can include arbitrary vendor comments, including the old #PING
++    // sentinel. A fresh unpredictable 128-bit token prevents listed data from
++    // impersonating this command's acknowledgement (negligible collision risk).
++    uint32_t nonce[4];
++    arc4random_buf(nonce, sizeof(nonce));
++    char ping[48];
++    snprintf(ping, sizeof(ping), "#NETD_ACK_%08x%08x%08x%08x\n",
++             nonce[0], nonce[1], nonce[2], nonce[3]);
++    return ping;
++}
+ 
+ // Not compile-time constants because they are changed by the unit tests.
+ int IptablesRestoreController::MAX_RETRIES = 50;
+@@ -192,7 +203,7 @@ IptablesProcess* IptablesRestoreController::forkAndExec(const IptablesProcessTyp
+ // so that they can be dumped on dumpsys.
+ int IptablesRestoreController::sendCommand(const IptablesProcessType type,
+                                            const std::string& command,
+-                                           std::string *output) {
++                                           std::string *output, bool allowRestart) {
+    std::unique_ptr<IptablesProcess> *process =
+            (type == IPTABLES_PROCESS) ? &mIpRestore : &mIp6Restore;
+ 
+@@ -211,6 +222,8 @@ int IptablesRestoreController::sendCommand(const IptablesProcessType type,
+     }
+ 
+     if (existingProcess == nullptr) {
++        // A continuation must never restart on a different table handle.
++        if (!allowRestart) return -1;
+         // Fork a new iptables[6]-restore process.
+         IptablesProcess *newProcess = IptablesRestoreController::forkAndExec(type);
+         if (newProcess == nullptr) {
+@@ -226,12 +239,13 @@ int IptablesRestoreController::sendCommand(const IptablesProcessType type,
+         return -1;
+     }
+ 
+-    if (!android::base::WriteFully((*process)->stdIn, PING, PING_SIZE)) {
++    const std::string ping = makePing();
++    if (!android::base::WriteFully((*process)->stdIn, ping.data(), ping.size())) {
+         ALOGE("Unable to send ping command: %s", strerror(errno));
+         return -1;
+     }
+ 
+-    if (!drainAndWaitForAck(*process, command, output)) {
++    if (!drainAndWaitForAck(*process, command, ping, output)) {
+         // drainAndWaitForAck has already logged an error.
+         return -1;
+     }
+@@ -257,7 +271,7 @@ void IptablesRestoreController::maybeLogStderr(const std::unique_ptr<IptablesPro
+ /* static */
+ bool IptablesRestoreController::drainAndWaitForAck(const std::unique_ptr<IptablesProcess> &process,
+                                                    const std::string& command,
+-                                                   std::string *output) {
++                                                   const std::string& ping, std::string *output) {
+     bool receivedAck = false;
+     int timeout = 0;
+     while (!receivedAck && (timeout++ < MAX_RETRIES)) {
+@@ -294,12 +308,12 @@ bool IptablesRestoreController::drainAndWaitForAck(const std::unique_ptr<Iptable
+                         // i == STDOUT_IDX: accumulate stdout into *output, and look
+                         // for the ping response.
+                         output->append(buffer, size);
+-                        size_t pos = output->find(PING);
++                        size_t pos = output->find(ping);
+                         if (pos != std::string::npos) {
+-                            if (output->size() > pos + PING_SIZE) {
+-                                size_t extra = output->size() - (pos + PING_SIZE);
++                            if (output->size() > pos + ping.size()) {
++                                size_t extra = output->size() - (pos + ping.size());
+                                 ALOGW("%zd extra characters after iptables response: '%s...'",
+-                                      extra, output->substr(pos + PING_SIZE, 128).c_str());
++                                      extra, output->substr(pos + ping.size(), 128).c_str());
+                             }
+                             output->resize(pos);
+                             receivedAck = true;
+@@ -352,6 +366,63 @@ int IptablesRestoreController::execute(const IptablesTarget target, const std::s
+     return res;
+ }
+ 
++int IptablesRestoreController::executeTableSnapshot(
++        IptablesTarget target, const std::string& table, const std::string& parent,
++        const TableUpdate& prepare) {
++    // Restrict command framing to single names, not restore command fragments.
++    const auto validName = [](const std::string& name) {
++        return !name.empty() && name.size() <= 28 &&
++               name.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
++                                      "0123456789_-") == std::string::npos;
++    };
++    if ((target != V4 && target != V6) || !validName(table) || !validName(parent) || !prepare) {
++        return -EINVAL;
++    }
++    std::lock_guard lock(mLock);
++    const auto type = target == V4 ? IPTABLES_PROCESS : IP6TABLES_PROCESS;
++    auto& process = target == V4 ? mIpRestore : mIp6Restore;
++    const auto abort = [&]() {
++        if (process) process->stop();
++        process.reset();
++    };
++    std::string listing;
++    // In this checkout, verbose comment markers are acknowledged inside a table. The
++    // restore parser keeps both the table handle and xtables lock until COMMIT.
++    if (sendCommand(type, "*" + table + "\n-S " + parent + "\n", &listing) != 0) {
++        abort();
++        return -EREMOTEIO;
++    }
++    std::string commands;
++    const int result = prepare(listing, &commands);
++    if (result != 0) {
++        abort();
++        return result < 0 ? result : -EINVAL;
++    }
++    // A callback may supply rules/chain declarations only. Keep the single commit
++    // boundary here; malformed framing must not publish a partial transaction.
++    bool valid = commands.find('\0') == std::string::npos &&
++                 commands.find('\r') == std::string::npos &&
++                 (commands.empty() || commands.back() == '\n');
++    for (size_t pos = 0; valid && pos < commands.size();) {
++        const size_t end = commands.find('\n', pos);
++        // Target iptables-restore uses a 10240-byte fgets buffer. Longer physical
++        // lines are split into commands and could smuggle an early COMMIT.
++        valid = end != std::string::npos && end - pos + 1 <= 10239 &&
++                (commands[pos] == '-' || commands[pos] == ':' || commands[pos] == '\n');
++        pos = end + 1;
++    }
++    if (!valid) {
++        abort();
++        return -EINVAL;
++    }
++    std::string output;
++    if (sendCommand(type, commands + "COMMIT\n", &output, false) != 0) {
++        abort();
++        return -EREMOTEIO;
++    }
++    return 0;
++}
++
+ int IptablesRestoreController::getIpRestorePid(const IptablesProcessType type) {
+     return type == IPTABLES_PROCESS ? mIpRestore->pid : mIp6Restore->pid;
+ }
+diff --git a/server/IptablesRestoreController.h b/server/IptablesRestoreController.h
+index b1c8dcd..9293303 100644
+--- a/server/IptablesRestoreController.h
++++ b/server/IptablesRestoreController.h
+@@ -17,6 +17,7 @@
+ #ifndef NETD_SERVER_IPTABLES_RESTORE_CONTROLLER_H
+ #define NETD_SERVER_IPTABLES_RESTORE_CONTROLLER_H
+ 
++#include <functional>
+ #include <memory>
+ #include <mutex>
+ #include <sys/types.h>
+@@ -45,6 +46,16 @@ class IptablesRestoreController final : public IptablesRestoreInterface {
+     int execute(const IptablesTarget target, const std::string& commands,
+                 std::string* output) override;
+ 
++    // List a parent chain, prepare an update, and commit using one child/table handle.
++    // Holds mLock AND the child's xtables lock from the listing through COMMIT.
++    // prepare must be bounded, non-reentrant, and free of other restore calls.
++    // It returns zero and table-local commands (no *table/COMMIT), or a negative errno.
++    // Callback/validation errors abort the uncommitted child; I/O failure is ambiguous
++    // and returns -EREMOTEIO. No retry or cross-family atomicity is provided.
++    using TableUpdate = std::function<int(const std::string&, std::string*)>;
++    int executeTableSnapshot(IptablesTarget target, const std::string& table,
++                             const std::string& parent, const TableUpdate& prepare);
++
+     enum IptablesProcessType {
+         IPTABLES_PROCESS,
+         IP6TABLES_PROCESS,
+@@ -74,16 +85,16 @@ private:
+     static IptablesProcess* forkAndExec(const IptablesProcessType type);
+ 
+     int sendCommand(const IptablesProcessType type, const std::string& command,
+-                    std::string *output);
++                    std::string *output, bool allowRestart = true);
+ 
+     static bool drainAndWaitForAck(const std::unique_ptr<IptablesProcess> &process,
+                                    const std::string& command,
+-                                   std::string *output);
++                                   const std::string& ping, std::string *output);
+ 
+     static void maybeLogStderr(const std::unique_ptr<IptablesProcess> &process,
+                                const std::string& command);
+ 
+-    // Guards calls to execute().
++    // Guards ordinary commands and whole snapshot/update transactions.
+     std::mutex mLock;
+ 
+     std::unique_ptr<IptablesProcess> mIpRestore;
+diff --git a/server/IptablesRestoreControllerTest.cpp b/server/IptablesRestoreControllerTest.cpp
+index d1c2ebb..3ce2dce 100644
+--- a/server/IptablesRestoreControllerTest.cpp
++++ b/server/IptablesRestoreControllerTest.cpp
+@@ -341,6 +341,51 @@ TEST_F(IptablesRestoreControllerTest, TestStartup) {
+   EXPECT_EQ(0, con.execute(V4V6, "#Test\n", nullptr));
+ }
+ 
++TEST_F(IptablesRestoreControllerTest, TestSnapshotRetainsXtablesLock) {
++    for (const auto target : {V4, V6}) {
++        EXPECT_EQ(0, con.executeTableSnapshot(target, "filter", mChainName,
++                [&](const std::string& listing, std::string* commands) {
++                    EXPECT_NE(std::string::npos, listing.find("-j RETURN"));
++                    int fd = open(XT_LOCK_NAME, O_CREAT | O_CLOEXEC, 0600);
++                    EXPECT_GE(fd, 0);
++                    if (fd < 0) return -errno;
++                    const int locked = flock(fd, LOCK_EX | LOCK_NB);
++                    const int error = errno;
++                    close(fd);
++                    EXPECT_EQ(-1, locked);
++                    EXPECT_TRUE(error == EWOULDBLOCK || error == EAGAIN);
++                    *commands = "-I " + mChainName + " 1 -j RETURN\n";
++                    return 0;
++                }));
++    }
++}
++
++TEST_F(IptablesRestoreControllerTest, TestSnapshotAbortDoesNotPublishUpdate) {
++    for (const auto target : {V4, V6}) {
++        const std::string query = "*filter\n-S " + mChainName + "\nCOMMIT\n";
++        std::string before, after;
++        ASSERT_EQ(0, con.execute(target, query, &before));
++        EXPECT_EQ(-EINVAL, con.executeTableSnapshot(target, "filter", mChainName,
++                [&](const std::string&, std::string* commands) {
++                    *commands = "-F " + mChainName + "\n";
++                    return -EINVAL;
++                }));
++        ASSERT_EQ(0, con.execute(target, query, &after));
++        EXPECT_EQ(before, after);
++    }
++}
++
++TEST_F(IptablesRestoreControllerTest, TestSnapshotRejectsEarlyCommit) {
++    for (const auto target : {V4, V6}) {
++        EXPECT_EQ(-EINVAL, con.executeTableSnapshot(target, "filter", mChainName,
++                [](const std::string&, std::string* commands) {
++                    *commands = "COMMIT\n";
++                    return 0;
++                }));
++        EXPECT_EQ(0, con.execute(target, "#Next command after abort\n", nullptr));
++    }
++}
++
+ // Out of SLO flakiness
+ TEST_F(IptablesRestoreControllerTest, DISABLED_TestMemoryLeak) {
+     std::string cmd = "*filter\n";
+diff --git a/server/OemNetdListener.cpp b/server/OemNetdListener.cpp
+index 9c44cf2..29b4752 100644
+--- a/server/OemNetdListener.cpp
++++ b/server/OemNetdListener.cpp
+@@ -17,6 +17,10 @@
+ #define LOG_TAG "OemNetd"
+ 
+ #include "OemNetdListener.h"
++#include "Controllers.h"
++
++#include <cerrno>
++#include "binder_utils/BinderUtil.h"
+ 
+ namespace com {
+ namespace android {
+@@ -25,7 +29,10 @@ namespace net {
+ 
+ ::android::sp<::android::IBinder> OemNetdListener::getListener() {
+     // Thread-safe initialization.
+-    static ::android::sp<OemNetdListener> listener = ::android::sp<OemNetdListener>::make();
++    static ::android::sp<OemNetdListener> listener = ::android::sp<OemNetdListener>::make(
++            ::android::net::gCtls ? ::android::net::gCtls->getTronaUidController() : nullptr,
++            ::android::net::gCtls ? ::android::net::gCtls->getTronaMeteredController() : nullptr,
++            ::android::net::gCtls ? &::android::net::gCtls->bandwidthCtrl : nullptr);
+     static ::android::sp<::android::IBinder> sIBinder = ::android::IInterface::asBinder(listener);
+     return sIBinder;
+ }
+@@ -42,6 +49,118 @@ namespace net {
+     return ::android::binder::Status::ok();
+ }
+ 
++::android::binder::Status OemNetdListener::replaceTronaUidPolicy(
++        const std::vector<int32_t>& users, const std::vector<TronaUidChain>& chains,
++        const std::vector<int32_t>& enabled) {
++    auto permission = checkAnyPermission({PERM_NETWORK_STACK, PERM_MAINLINE_NETWORK_STACK});
++    if (!permission.isOk()) return permission;
++    if (!mTronaUidController) return statusFromErrcode(-EOPNOTSUPP);
++    std::map<int, std::vector<int>> members;
++    for (const auto& chain : chains) {
++        if (!members.emplace(chain.chain, chain.uids).second) return statusFromErrcode(-EINVAL);
++    }
++    return statusFromErrcode(mTronaUidController->ReplayPolicy(
++            std::set<int>(users.begin(), users.end()), members,
++            std::set<int>(enabled.begin(), enabled.end())));
++}
++
++::android::binder::Status OemNetdListener::setTronaUidRule(int32_t chain, int32_t uid, int32_t rule) {
++    auto permission = checkAnyPermission({PERM_NETWORK_STACK, PERM_MAINLINE_NETWORK_STACK});
++    if (!permission.isOk()) return permission;
++    if (!mTronaUidController) return statusFromErrcode(-EOPNOTSUPP);
++    return statusFromErrcode(mTronaUidController->SetUidRule(chain, uid, rule));
++}
++
++::android::binder::Status OemNetdListener::getTronaUidRule(int32_t chain, int32_t uid, int32_t* rule) {
++    auto permission = checkAnyPermission({PERM_NETWORK_STACK, PERM_MAINLINE_NETWORK_STACK});
++    if (!permission.isOk()) return permission;
++    if (!mTronaUidController) return statusFromErrcode(-EOPNOTSUPP);
++    return statusFromErrcode(mTronaUidController->GetUidRule(chain, uid, rule));
++}
++
++::android::binder::Status OemNetdListener::setTronaChildChain(int32_t chain, bool enabled) {
++    auto permission = checkAnyPermission({PERM_NETWORK_STACK, PERM_MAINLINE_NETWORK_STACK});
++    if (!permission.isOk()) return permission;
++    if (!mTronaUidController) return statusFromErrcode(-EOPNOTSUPP);
++    return statusFromErrcode(mTronaUidController->SetChildChain(chain, enabled));
++}
++
++::android::binder::Status OemNetdListener::isTronaChildChainEnabled(int32_t chain, bool* enabled) {
++    auto permission = checkAnyPermission({PERM_NETWORK_STACK, PERM_MAINLINE_NETWORK_STACK});
++    if (!permission.isOk()) return permission;
++    if (!mTronaUidController) return statusFromErrcode(-EOPNOTSUPP);
++    return statusFromErrcode(mTronaUidController->GetChildChainEnabled(chain, enabled));
++}
++
++::android::binder::Status OemNetdListener::replaceTronaMeteredPolicy(
++        const std::vector<int32_t>& users, const std::vector<int32_t>& allowed,
++        const std::vector<int32_t>& userDenied, const std::vector<int32_t>& adminDenied) {
++    auto permission = checkAnyPermission({PERM_NETWORK_STACK, PERM_MAINLINE_NETWORK_STACK});
++    if (!permission.isOk()) return permission;
++    if (!mTronaMeteredController) return statusFromErrcode(-EOPNOTSUPP);
++    return statusFromErrcode(mTronaMeteredController->ReplacePolicy(
++            std::set<int>(users.begin(), users.end()), std::set<int>(allowed.begin(), allowed.end()),
++            std::set<int>(userDenied.begin(), userDenied.end()),
++            std::set<int>(adminDenied.begin(), adminDenied.end())));
++}
++
++::android::binder::Status OemNetdListener::setTronaMeteredUidRule(
++        int32_t chain, int32_t uid, int32_t rule) {
++    auto permission = checkAnyPermission({PERM_NETWORK_STACK, PERM_MAINLINE_NETWORK_STACK});
++    if (!permission.isOk()) return permission;
++    if (!mTronaMeteredController) return statusFromErrcode(-EOPNOTSUPP);
++    return statusFromErrcode(mTronaMeteredController->SetUidRule(chain, uid, rule));
++}
++
++::android::binder::Status OemNetdListener::getTronaMeteredUidRule(
++        int32_t chain, int32_t uid, int32_t* rule) {
++    auto permission = checkAnyPermission({PERM_NETWORK_STACK, PERM_MAINLINE_NETWORK_STACK});
++    if (!permission.isOk()) return permission;
++    if (!mTronaMeteredController) return statusFromErrcode(-EOPNOTSUPP);
++    return statusFromErrcode(mTronaMeteredController->GetUidRule(chain, uid, rule));
++}
++
++::android::binder::Status OemNetdListener::getTronaUidBlockedStatus(
++        int32_t uid, TronaUidBlockedStatus* blockedStatus) {
++    auto permission = checkAnyPermission({PERM_NETWORK_STACK, PERM_MAINLINE_NETWORK_STACK});
++    if (!permission.isOk()) return permission;
++    if (!mTronaUidController || !mTronaMeteredController || !mTronaBandwidthController) {
++        return statusFromErrcode(-EOPNOTSUPP);
++    }
++    if (uid < 0 || !blockedStatus) return statusFromErrcode(-EINVAL);
++    TronaUidBlockedStatus result;
++    for (int chain = 1; chain <= 9; ++chain) {
++        bool enabled;
++        if (int error = mTronaUidController->GetChildChainEnabled(chain, &enabled)) {
++            return statusFromErrcode(error);
++        }
++        if (enabled) result.enabledChains.push_back(chain);
++        int rule;
++        if (int error = mTronaUidController->GetUidRule(chain, uid, &rule)) {
++            return statusFromErrcode(error);
++        }
++        if (rule != 1 && rule != 2) return statusFromErrcode(-EIO);
++        if (rule == 2) result.deniedChains.push_back(chain);
++    }
++    for (int chain = 10; chain <= 12; ++chain) {
++        int rule;
++        if (int error = mTronaMeteredController->GetUidRule(chain, uid, &rule)) {
++            return statusFromErrcode(error);
++        }
++        if (rule != 1 && rule != 2) return statusFromErrcode(-EIO);
++        if (rule == 2) result.deniedChains.push_back(chain);
++    }
++    {
++        std::lock_guard guard(mTronaBandwidthController->lock);
++        if (int error = mTronaBandwidthController->getDataSaverEnabled(&result.dataSaverEnabled)) {
++            return statusFromErrcode(error);
++        }
++    }
++    // Publish only a complete successful observation; never an empty fallback.
++    *blockedStatus = std::move(result);
++    return ::android::binder::Status::ok();
++}
++
+ void OemNetdListener::registerOemUnsolicitedEventListenerInternal(
+         const ::android::sp<IOemNetdUnsolicitedEventListener>& listener) {
+     std::lock_guard lock(mOemUnsolicitedMutex);
+diff --git a/server/OemNetdListener.h b/server/OemNetdListener.h
+index b94827b..cc58ca6 100644
+--- a/server/OemNetdListener.h
++++ b/server/OemNetdListener.h
+@@ -18,12 +18,20 @@
+ #define NETD_SERVER_OEM_NETD_LISTENER_H
+ 
+ #include <map>
++#include <memory>
++#include <utility>
++#include <vector>
+ #include <mutex>
+ 
+ #include <android-base/thread_annotations.h>
+ #include "com/android/internal/net/BnOemNetd.h"
++#include "trona/UidRuleController.h"
++#include "trona/MeteredUidController.h"
++#include "com/android/internal/net/TronaUidBlockedStatus.h"
+ #include "com/android/internal/net/IOemNetdUnsolicitedEventListener.h"
+ 
++class BandwidthController;
++
+ namespace com {
+ namespace android {
+ namespace internal {
+@@ -34,7 +42,16 @@ class OemNetdListener : public BnOemNetd {
+     using OemUnsolListenerMap = std::map<const ::android::sp<IOemNetdUnsolicitedEventListener>,
+                                          const ::android::sp<::android::IBinder::DeathRecipient>>;
+ 
+-    OemNetdListener() = default;
++    // Selection and top-level hooks belong to native startup, not Binder callers.
++    // Native Controllers publishes a handle only after successful startup.
++    // Default startup has none; the listener shares immutable ownership, not selection.
++    explicit OemNetdListener(
++            std::shared_ptr<::trona::network::UidRuleController> controller = nullptr,
++            std::shared_ptr<::trona::network::MeteredUidController> meteredController = nullptr,
++            ::BandwidthController* bandwidthController = nullptr)
++        : mTronaUidController(std::move(controller)),
++          mTronaMeteredController(std::move(meteredController)),
++          mTronaBandwidthController(bandwidthController) {}
+     ~OemNetdListener() = default;
+     static ::android::sp<::android::IBinder> getListener();
+ 
+@@ -42,7 +59,30 @@ class OemNetdListener : public BnOemNetd {
+     ::android::binder::Status registerOemUnsolicitedEventListener(
+             const ::android::sp<IOemNetdUnsolicitedEventListener>& listener) override;
+ 
++    ::android::binder::Status replaceTronaUidPolicy(const std::vector<int32_t>& users,
++            const std::vector<TronaUidChain>& chains, const std::vector<int32_t>& enabled) override;
++    ::android::binder::Status setTronaUidRule(int32_t chain, int32_t uid, int32_t rule) override;
++    ::android::binder::Status getTronaUidRule(int32_t chain, int32_t uid, int32_t* rule) override;
++    ::android::binder::Status setTronaChildChain(int32_t chain, bool enabled) override;
++    ::android::binder::Status isTronaChildChainEnabled(int32_t chain, bool* enabled) override;
++
++    ::android::binder::Status replaceTronaMeteredPolicy(const std::vector<int32_t>& users,
++            const std::vector<int32_t>& allowed, const std::vector<int32_t>& userDenied,
++            const std::vector<int32_t>& adminDenied) override;
++    ::android::binder::Status setTronaMeteredUidRule(int32_t chain, int32_t uid, int32_t rule) override;
++    ::android::binder::Status getTronaMeteredUidRule(int32_t chain, int32_t uid, int32_t* rule) override;
++
++    ::android::binder::Status getTronaUidBlockedStatus(int32_t uid,
++            TronaUidBlockedStatus* blockedStatus) override;
++
+   private:
++    // Immutable ownership; all policy operations serialize inside UidRuleController.
++    const std::shared_ptr<::trona::network::UidRuleController> mTronaUidController;
++    // Selected controller availability only: full snapshot replay must ACK before use.
++    const std::shared_ptr<::trona::network::MeteredUidController> mTronaMeteredController;
++    // Non-owning: gCtls and its bandwidth controller live for the daemon process.
++    // Null by default; availability does not fabricate an ACK or select a backend.
++    ::BandwidthController* const mTronaBandwidthController;
+     std::mutex mOemUnsolicitedMutex;
+ 
+     OemUnsolListenerMap mOemUnsolListenerMap GUARDED_BY(mOemUnsolicitedMutex);
+diff --git a/server/binder/com/android/internal/net/IOemNetd.aidl b/server/binder/com/android/internal/net/IOemNetd.aidl
+index da4e3c6..8423435 100644
+--- a/server/binder/com/android/internal/net/IOemNetd.aidl
++++ b/server/binder/com/android/internal/net/IOemNetd.aidl
+@@ -17,8 +17,11 @@
+ package com.android.internal.net;
+ 
+ import com.android.internal.net.IOemNetdUnsolicitedEventListener;
++import com.android.internal.net.TronaUidChain;
++import com.android.internal.net.TronaUidBlockedStatus;
+ 
+ /** @hide */
++@Descriptor("value=no.jarjar.com.android.internal.net.IOemNetd")
+ interface IOemNetd {
+    /**
+     * Returns true if the service is responding.
+@@ -31,4 +34,23 @@ interface IOemNetd {
+     * @param listener oem unsolicited event listener to register
+     */
+     void registerOemUnsolicitedEventListener(IOemNetdUnsolicitedEventListener listener);
++    // Device-local legacy backend. All calls require NETWORK_STACK or
++    // MAINLINE_NETWORK_STACK and return ServiceSpecificException on failure.
++    // EOPNOTSUPP means no selected/verified backend; it is never policy success.
++    // Replay must include every nonmetered chain (1..9) and the full active-user set.
++    void replaceTronaUidPolicy(in int[] users, in TronaUidChain[] chains, in int[] enabled);
++    void setTronaUidRule(int chain, int uid, int rule);
++    int getTronaUidRule(int chain, int uid);
++    void setTronaChildChain(int chain, boolean enabled);
++    boolean isTronaChildChainEnabled(int chain);
++    // Metered membership snapshot and mutations (chains 10/11/12).
++    // Requires NETWORK_STACK or MAINLINE_NETWORK_STACK. Initial/uncertain state
++    // returns EAGAIN until full replacement ACK. No packet hook/readiness claim.
++    void replaceTronaMeteredPolicy(in int[] users, in int[] allowed,
++            in int[] userDenied, in int[] adminDenied);
++    void setTronaMeteredUidRule(int chain, int uid, int rule);
++    int getTronaMeteredUidRule(int chain, int uid);
++    // Complete native membership/enable observation plus ACK-known Data Saver.
++    // Unsupported/unknown/error state fails the entire result.
++    TronaUidBlockedStatus getTronaUidBlockedStatus(int uid);
+ }
+diff --git a/server/binder/com/android/internal/net/IOemNetdUnsolicitedEventListener.aidl b/server/binder/com/android/internal/net/IOemNetdUnsolicitedEventListener.aidl
+index e6da6b1..ad509f8 100644
+--- a/server/binder/com/android/internal/net/IOemNetdUnsolicitedEventListener.aidl
++++ b/server/binder/com/android/internal/net/IOemNetdUnsolicitedEventListener.aidl
+@@ -19,6 +19,7 @@ package com.android.internal.net;
+ /**
+  * @hide
+  */
++@Descriptor("value=no.jarjar.com.android.internal.net.IOemNetdUnsolicitedEventListener")
+ oneway interface IOemNetdUnsolicitedEventListener {
+ 
+    /**
+diff --git a/server/binder/com/android/internal/net/TronaUidBlockedStatus.aidl b/server/binder/com/android/internal/net/TronaUidBlockedStatus.aidl
+new file mode 100644
+index 0000000..d05d5cb
+--- /dev/null
++++ b/server/binder/com/android/internal/net/TronaUidBlockedStatus.aidl
+@@ -0,0 +1,8 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.android.internal.net;
++/** @hide Device-local observation, not a new policy cache or global transaction. */
++parcelable TronaUidBlockedStatus {
++    int[] enabledChains;
++    int[] deniedChains;
++    boolean dataSaverEnabled;
++}
+diff --git a/server/binder/com/android/internal/net/TronaUidChain.aidl b/server/binder/com/android/internal/net/TronaUidChain.aidl
+new file mode 100644
+index 0000000..c7f36fc
+--- /dev/null
++++ b/server/binder/com/android/internal/net/TronaUidChain.aidl
+@@ -0,0 +1,8 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.android.internal.net;
++
++/** @hide */
++parcelable TronaUidChain {
++    int chain;
++    int[] uids;
++}
+diff --git a/server/main.cpp b/server/main.cpp
+index be9a1d0..6d6d44e 100644
+--- a/server/main.cpp
++++ b/server/main.cpp
+@@ -32,6 +32,7 @@
+ 
+ #include "log/log.h"
+ 
++#include <android-base/properties.h>
+ #include <android/binder_manager.h>
+ #include <android/binder_process.h>
+ #include <binder/IPCThreadState.h>
+@@ -52,6 +53,10 @@
+ #include "Process.h"
+ 
+ #include "NetdUpdatablePublic.h"
++#include "trona/NativeNetworkProfile.h"
++#include "trona/RetainedNetworkPrerequisites.h"
++#include "trona/tag-auth/LegacyNativeTagAdapters.h"
++#include "trona/tag-auth/LegacySocketTagger.h"
+ #include "netd_resolv/resolv.h"
+ 
+ using android::IPCThreadState;
+@@ -92,7 +97,18 @@ void logCallback(const char* msg) {
+ int tagSocketCallback(int sockFd, uint32_t tag, uid_t uid, pid_t) {
+     // Workaround for secureVPN with VpnIsolation enabled, refer to b/159994981 for details.
+     if (tag == TAG_SYSTEM_DNS) uid = AID_DNS;
+-    return libnetd_updatable_tagSocket(sockFd, tag, uid, AID_DNS);
++    trona::network::RequestedNetworkBackend backend;
++    const int error = trona::network::GetRequestedNetworkBackend(&backend);
++    if (error != 0) return error;
++    switch (backend) {
++        case trona::network::RequestedNetworkBackend::Modern:
++            return libnetd_updatable_tagSocket(sockFd, tag, uid, AID_DNS);
++        case trona::network::RequestedNetworkBackend::TronaLegacy:
++            // Trusted resolver callback; private DNS legitimately has no client PID.
++            // The daemon must initialize the real selected core before resolver startup.
++            return trona::network::TagLegacySocket(sockFd, tag, uid);
++    }
++    return -EOPNOTSUPP;
+ }
+ 
+ bool evaluateDomainNameCallback(const android_net_context& netcontext, const char* /*name*/) {
+@@ -118,13 +134,64 @@ bool initDnsResolver() {
+     return resolv_init(&callbacks);
+ }
+ 
++// BEGIN retained startup helpers
++// This is native-core readiness only. Java must still ACK its full policy/user replay.
++int verifyLegacyAttribution(trona::network::OwnerAttribution* attribution) {
++    const int error = trona::network::VerifyRetainedNetworkPrerequisites(attribution);
++    if (error != 0) return error < 0 ? error : -EIO;
++    return *attribution == trona::network::OwnerAttribution::VerifiedQtaguid ? 0 : -EOPNOTSUPP;
++}
++
++int runLegacyNetdOneshot() {
++    trona::network::OwnerAttribution attribution = trona::network::OwnerAttribution::Unverified;
++    int error = verifyLegacyAttribution(&attribution);
++    if (error != 0) return error;
++    std::string expectedReadyToken;
++    error = trona::network::CaptureLegacyNativeReadyToken(&expectedReadyToken);
++    if (error != 0) return error;
++    // exec_start must finish before init advances to the already queued zygote-start.
++    // It never creates the core or publishes ready; only the real daemon can do that.
++    if (!android::base::WaitForProperty(trona::network::kLegacyNativeReadyProperty,
++                                       expectedReadyToken,
++                                       std::chrono::seconds(30))) {
++        return -ETIMEDOUT;
++    }
++    error = trona::network::RequireLegacyNativeReady();
++    if (error != 0) return error;
++    if (android::base::GetProperty("init.svc.netd", "") != "running") return -ENOTCONN;
++    return 0;
++}
++// END retained startup helpers
+ }  // namespace
+ 
+ int main(const int argc, const char* argv[]) {
++    trona::network::RequestedNetworkBackend backend;
++    const int profileError = trona::network::GetRequestedNetworkBackend(&backend);
++    if (profileError != 0 ||
++        (backend != trona::network::RequestedNetworkBackend::Modern &&
++         backend != trona::network::RequestedNetworkBackend::TronaLegacy)) {
++        ALOGE("Unsupported native network profile: %d", profileError);
++        return 1;
++    }
++    const bool legacy = backend == trona::network::RequestedNetworkBackend::TronaLegacy;
+     if ((argc == 2) && !strcmp(argv[1], "oneshot")) {
++        if (legacy) {
++            const int error = runLegacyNetdOneshot();
++            if (error != 0) ALOGE("Legacy native startup barrier failed: %d", error);
++            return error == 0 ? 0 : 1;
++        }
+         setenv("NETD_ONESHOT", "1", 1);
+         return libnetd_updatable_init("/sys/fs/cgroup");
+     }
++    if (legacy && !android::base::SetProperty(trona::network::kLegacyNativeReadyProperty, "0")) {
++        ALOGE("Unable to reset legacy native readiness");
++        return 1;
++    }
++    std::string legacyReadyToken;
++    if (legacy && trona::network::CaptureLegacyNativeReadyToken(&legacyReadyToken) != 0) {
++        ALOGE("Unable to capture init-owned legacy netd generation");
++        return 1;
++    }
+ 
+     Stopwatch s;
+     gLog.info("netd starting");
+@@ -139,17 +206,35 @@ int main(const int argc, const char* argv[]) {
+         setCloseOnExec(sock);
+     }
+ 
+-    std::string cg2_path;
+-    if (!CgroupGetControllerPath(CGROUPV2_HIERARCHY_NAME, &cg2_path)) {
+-        ALOGE("Failed to find cgroup v2 root %s", strerror(errno));
+-        exit(1);
+-    }
++    std::optional<trona::network::OwnerAttribution> tronaAttribution;
++    std::shared_ptr<trona::network::LegacyTagDispatcher> tagDispatcher;
++    if (legacy) {
++        trona::network::OwnerAttribution attribution = trona::network::OwnerAttribution::Unverified;
++        const int error = verifyLegacyAttribution(&attribution);
++        if (error != 0) {
++            ALOGE("Retained network prerequisites failed: %d", error);
++            exit(1);
++        }
++        int dispatcherError = 0;
++        tagDispatcher = trona::network::CreateLegacyNativeTagDispatcher(&dispatcherError);
++        if (!tagDispatcher || dispatcherError != 0) {
++            ALOGE("Unable to create selected legacy tag dispatcher: %d", dispatcherError);
++            exit(1);
++        }
++        tronaAttribution = attribution;
++    } else {
++        std::string cg2_path;
++        if (!CgroupGetControllerPath(CGROUPV2_HIERARCHY_NAME, &cg2_path)) {
++            ALOGE("Failed to find cgroup v2 root %s", strerror(errno));
++            exit(1);
++        }
+ 
+-    if (libnetd_updatable_init(cg2_path.c_str())) {
+-        ALOGE("libnetd_updatable_init failed");
+-        exit(1);
++        if (libnetd_updatable_init(cg2_path.c_str())) {
++            ALOGE("libnetd_updatable_init failed");
++            exit(1);
++        }
++        gLog.info("libnetd_updatable_init success");
+     }
+-    gLog.info("libnetd_updatable_init success");
+ 
+     NetlinkManager *nm = NetlinkManager::Instance();
+     if (nm == nullptr) {
+@@ -158,8 +243,12 @@ int main(const int argc, const char* argv[]) {
+     };
+     gLog.info("NetlinkManager instanced");
+ 
+-    gCtls = new android::net::Controllers();
++    gCtls = new android::net::Controllers(tronaAttribution);
+     gCtls->init();
++    if (legacy && (!gCtls->getTronaUidController() || !gCtls->getTronaMeteredController())) {
++        ALOGE("Selected legacy policy owners were not initialized");
++        exit(1);
++    }
+ 
+     if (nm->start()) {
+         ALOGE("Unable to start NetlinkManager (%s)", strerror(errno));
+@@ -192,7 +281,7 @@ int main(const int argc, const char* argv[]) {
+         exit(1);
+     }
+ 
+-    FwmarkServer fwmarkServer(&gCtls->netCtrl, &gCtls->eventReporter);
++    FwmarkServer fwmarkServer(&gCtls->netCtrl, &gCtls->eventReporter, tagDispatcher);
+     if (fwmarkServer.startListener()) {
+         ALOGE("Unable to start FwmarkServer (%s)", strerror(errno));
+         exit(1);
+@@ -214,6 +303,18 @@ int main(const int argc, const char* argv[]) {
+ 
+     android::net::process::ScopedPidFile pidFile(PID_FILE_PATH);
+ 
++    // These mandatory services are now usable. Optional HAL/logging readiness is unchanged.
++    if (legacy) {
++        std::string currentReadyToken;
++        if (trona::network::CaptureLegacyNativeReadyToken(&currentReadyToken) != 0 ||
++            currentReadyToken != legacyReadyToken ||
++            !android::base::SetProperty(trona::network::kLegacyNativeReadyProperty,
++                                        legacyReadyToken)) {
++            ALOGE("Unable to publish current-generation legacy native readiness");
++            exit(1);
++        }
++    }
++
+     // Now that netd is ready to process commands, advertise service availability for HAL clients.
+     // Usage of this HAL is anticipated to be thin; one thread per HAL service should suffice,
+     // AIDL and HIDL.
+diff --git a/server/netd.rc b/server/netd.rc
+index 38f7cd4..77f17ce 100644
+--- a/server/netd.rc
++++ b/server/netd.rc
+@@ -1,7 +1,7 @@
+ # This should be similar to proper 'netd' below, this is merely a quick self test during bootup.
+ # If this invocation fails during a mainline module update it should trigger a module rollback.
+ service netd1shot /system/bin/netd oneshot
+-    disabled # only started once bpf programs are loaded
++    disabled # started by the selected synchronous network boot path
+     class main
+     capabilities CHOWN DAC_OVERRIDE DAC_READ_SEARCH FOWNER IPC_LOCK KILL NET_ADMIN NET_BIND_SERVICE NET_RAW SETUID SETGID
+     user root
+@@ -14,7 +14,7 @@ service netd1shot /system/bin/netd oneshot
+ 
+ # Keep in sync with 'netd1shot' above.
+ service netd /system/bin/netd
+-    disabled # only started once bpf programs are loaded
++    disabled # started by the selected synchronous network boot path
+     class main
+     capabilities CHOWN DAC_OVERRIDE DAC_READ_SEARCH FOWNER IPC_LOCK KILL NET_ADMIN NET_BIND_SERVICE NET_RAW SETUID SETGID
+     user root
+@@ -29,6 +29,8 @@ service netd /system/bin/netd
+     # Mark it as updatable so init won't start it until all APEX packages are ready.
+     updatable
+     # for obvious reasons 'onrestart' doesn't apply to netd1shot above
++    # Clear synchronously before restarting Java owners; do not use queued state callbacks.
++    onrestart setprop sys.trona.netd_ready 0
+     onrestart restart zygote
+     onrestart restart zygote_secondary
+ 
+diff --git a/server/trona/LegacyFirewallRules.cpp b/server/trona/LegacyFirewallRules.cpp
+new file mode 100644
+index 0000000..e6202eb
+--- /dev/null
++++ b/server/trona/LegacyFirewallRules.cpp
+@@ -0,0 +1,77 @@
++// SPDX-License-Identifier: Apache-2.0
++#include "LegacyFirewallRules.h"
++#include <cerrno>
++
++namespace trona::network {
++namespace {
++constexpr Chain chains[] = {
++    {1, "fw_dozable", true, false},
++    {2, "fw_standby", false, false},
++    {3, "fw_powersave", true, false},
++    {4, "fw_restricted", true, false},
++    {5, "fw_low_power_standby", true, false},
++    {6, "fw_background", true, false},
++    {7, "fw_oem_deny_1", false, false},
++    {8, "fw_oem_deny_2", false, false},
++    {9, "fw_oem_deny_3", false, false},
++    {10, "fw_metered_allow", true, true},
++    {11, "fw_metered_deny_user", false, true},
++    {12, "fw_metered_deny_admin", false, true},
++};
++}
++const Chain* FindChain(int id) {
++    for (const auto& chain : chains) {
++        if (chain.id == id) return &chain;
++    }
++    return nullptr;
++}
++int BuildUidRuleUpdate(int id, int uid, int rule, std::string* output) {
++    if (!output) return -EINVAL;
++    output->clear();
++    const Chain* chain = FindChain(id);
++    if (!chain || uid < 0 || (rule != 1 && rule != 2)) return -EINVAL;
++    if (chain->metered) return -EOPNOTSUPP;
++    const char* operation = chain->allowlist ? (rule == 1 ? "-I" : "-D")
++                                           : (rule == 2 ? "-A" : "-D");
++    const char* target = chain->allowlist ? "RETURN" : "DROP";
++    *output = std::string("*filter\n") + operation + " " + chain->name +
++              " -m owner --uid-owner " + std::to_string(uid) + " -j " + target + "\nCOMMIT\n";
++    return 0;
++}
++int BuildPacketDispatch(Direction direction, const std::set<int>& users,
++                        const std::set<int>& enabled, std::string* output,
++                        OwnerAttribution attribution) {
++    if (!output) return -EINVAL;
++    output->clear();
++    if ((direction != Direction::Ingress && direction != Direction::Egress) || !users.count(0))
++        return -EINVAL;
++    for (int user : users) if (user < 0 || user > 21474) return -EINVAL;
++    for (int id : enabled) {
++        const Chain* chain = FindChain(id);
++        if (!chain) return -EINVAL;
++        if (chain->metered) return -EOPNOTSUPP;
++    }
++    if (attribution != OwnerAttribution::VerifiedQtaguid) return -EOPNOTSUPP;
++    const bool ingress = direction == Direction::Ingress;
++    const std::string parent = ingress ? "tr_uid_in" : "tr_uid_out";
++    const std::string append = "-A " + parent + " ";
++    std::string command = "*filter\n:" + parent + " -\n-F " + parent + "\n";
++    command += append + "-m owner ! --uid-owner 0-4294967294 -j RETURN\n";
++    command += append + "-m owner --uid-owner 65534 -j RETURN\n";
++    for (int user : users) {
++        long long first = static_cast<long long>(user) * 100000;
++        command += append + "-m owner --uid-owner " + std::to_string(first) + "-" +
++                   std::to_string(first + 9999) + " -j RETURN\n";
++    }
++    command += append + "-p esp -j RETURN\n";
++    command += append + "-p tcp --tcp-flags RST RST -j RETURN\n";
++    if (ingress) command += append + "-p tcp --tcp-flags FIN FIN -j RETURN\n";
++    for (int id : enabled) {
++        command += append;
++        if (id == 6) command += ingress ? "! -i lo " : "! -o lo ";
++        command += std::string("-j ") + FindChain(id)->name + "\n";
++    }
++    *output = command + "COMMIT\n";
++    return 0;
++}
++}
+diff --git a/server/trona/LegacyFirewallRules.h b/server/trona/LegacyFirewallRules.h
+new file mode 100644
+index 0000000..3ea1eaf
+--- /dev/null
++++ b/server/trona/LegacyFirewallRules.h
+@@ -0,0 +1,25 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++#include <string>
++#include <set>
++
++namespace trona::network {
++struct Chain {
++    int id;
++    const char* name;
++    bool allowlist;
++    bool metered;
++};
++const Chain* FindChain(int id);
++// Compile one UID mutation for the IPv4+IPv6 restore boundary. No commands execute here.
++// This primitive is NOT an idempotent setUidRule API: the controller must reconcile state
++// or replace complete chains. Replaying additions can create duplicate iptables rules.
++// Metered chains require their separate interface-aware backend and return EOPNOTSUPP.
++int BuildUidRuleUpdate(int chain, int uid, int rule, std::string* output);
++enum class Direction { Ingress, Egress };
++enum class OwnerAttribution { Unverified, VerifiedQtaguid };
++// Generates unhooked packet-dispatch chains only; not socket-creation permission policy.
++int BuildPacketDispatch(Direction direction, const std::set<int>& users,
++                        const std::set<int>& enabled, std::string* output,
++                        OwnerAttribution attribution = OwnerAttribution::Unverified);
++}
+diff --git a/server/trona/LegacyQtaguidStats.cpp b/server/trona/LegacyQtaguidStats.cpp
+new file mode 100644
+index 0000000..5922959
+--- /dev/null
++++ b/server/trona/LegacyQtaguidStats.cpp
+@@ -0,0 +1,138 @@
++// SPDX-License-Identifier: Apache-2.0
++#include "LegacyQtaguidStats.h"
++#include <array>
++#include <cerrno>
++#include <charconv>
++#include <cstring>
++#include <locale>
++#include <sstream>
++#include <string_view>
++#include <utility>
++
++namespace trona::network {
++namespace {
++template <typename T> bool decimal(std::string_view text, T* output) {
++    if (text.empty() || text[0] == '-' || text[0] == '+') return false;
++    const auto end = text.data() + text.size();
++    const auto result = std::from_chars(text.data(), end, *output, 10);
++    return result.ec == std::errc{} && result.ptr == end;
++}
++
++template <size_t N> bool fields(const std::string& line, std::array<std::string, N>* values) {
++    std::istringstream stream(line);
++    stream.imbue(std::locale::classic());
++    for (auto& value : *values) if (!(stream >> value)) return false;
++    // Kernel TCP/UDP/other breakdown columns are not part of the returned totals.
++    return true;
++}
++
++bool tag(std::string_view text, int32_t* output, uint64_t* rawOutput) {
++    if (text.size() < 3 || text[0] != '0' || (text[1] != 'x' && text[1] != 'X')) return false;
++    text.remove_prefix(2);
++    uint64_t combined;
++    const auto end = text.data() + text.size();
++    const auto result = std::from_chars(text.data(), end, combined, 16);
++    if (result.ec != std::errc{} || result.ptr != end) return false;
++    // Match NetworkStatsFactory.kernelToTag: upper 32 bits, retaining signed
++    // Android tag bit patterns (for example 0xffffff01 -> -255).
++    const uint32_t upper = combined >> 32;
++    static_assert(sizeof(upper) == sizeof(*output));
++    std::memcpy(output, &upper, sizeof(upper));
++    *rawOutput = combined;
++    return true;
++}
++}  // namespace
++
++int ReadQtaguidStats(std::istream& input, std::vector<QtaguidStatsEntry>* output) {
++    if (!output || input.exceptions() != std::ios::goodbit) return -EINVAL;
++    std::string line;
++    if (!std::getline(input, line)) return input.bad() ? -EIO : -EPROTO;
++    std::array<std::string, 9> values;
++    const std::array<std::string, 9> expected = {"idx", "iface", "acct_tag_hex", "uid_tag_int",
++            "cnt_set", "rx_bytes", "rx_packets", "tx_bytes", "tx_packets"};
++    if (!fields(line, &values) || values != expected) return -EPROTO;
++    uint64_t previous = 1;
++    std::vector<QtaguidStatsEntry> parsed;
++    while (std::getline(input, line)) {
++        if (!fields(line, &values)) return -EPROTO;
++        uint64_t index;
++        QtaguidStatsEntry entry{};
++        if (!decimal(values[0], &index) || previous == UINT64_MAX || index != previous + 1
++                || values[1].empty() || values[1].size() >= 32
++                || values[1].find('\0') != std::string::npos
++                || !tag(values[2], &entry.tag, &entry.rawTag) || !decimal(values[3], &entry.uid)
++                || !decimal(values[4], &entry.set) || !decimal(values[5], &entry.rxBytes)
++                || !decimal(values[6], &entry.rxPackets) || !decimal(values[7], &entry.txBytes)
++                || !decimal(values[8], &entry.txPackets)) return -EPROTO;
++        previous = index;
++        entry.iface = values[1];
++        parsed.push_back(std::move(entry));
++    }
++    if (input.bad() || (!input.eof() && input.fail())) return -EIO;
++    output->swap(parsed);
++    return 0;
++}
++}  // namespace trona::network
++
++namespace trona::network {
++namespace {
++bool ifaceCounters(std::istringstream& row, std::array<int64_t, 4>* counters) {
++    std::string field;
++    for (auto& counter : *counters) {
++        if (!(row >> field) || !decimal(field, &counter)) return false;
++    }
++    return true;
++}
++}  // namespace
++
++int ReadQtaguidIfaceStats(std::istream& input, QtaguidIfaceFormat format,
++                         std::vector<QtaguidStatsEntry>* output) {
++    if (!output || input.exceptions() != std::ios::goodbit
++            || (format != QtaguidIfaceFormat::All && format != QtaguidIfaceFormat::Formatted)) {
++        return -EINVAL;
++    }
++    std::string line;
++    if (format == QtaguidIfaceFormat::Formatted) {
++        if (!std::getline(input, line)) return input.bad() ? -EIO : -EPROTO;
++        std::array<std::string, 5> names;
++        const std::array<std::string, 5> expected = {"ifname", "total_skb_rx_bytes",
++                "total_skb_rx_packets", "total_skb_tx_bytes", "total_skb_tx_packets"};
++        if (!fields(line, &names) || names != expected) return -EPROTO;
++    }
++    std::vector<QtaguidStatsEntry> parsed;
++    while (std::getline(input, line)) {
++        std::istringstream row(line);
++        row.imbue(std::locale::classic());
++        QtaguidStatsEntry entry{};
++        entry.uid = -1;  // NetworkStats.UID_ALL
++        entry.set = -1;  // NetworkStats.SET_ALL
++        if (!(row >> entry.iface) || entry.iface.size() >= 32
++                || entry.iface.find('\0') != std::string::npos) return -EPROTO;
++        int32_t active = 0;
++        if (format == QtaguidIfaceFormat::All) {
++            std::string field;
++            if (!(row >> field) || !decimal(field, &active)) return -EPROTO;
++        }
++        std::array<int64_t, 4> counters;
++        if (!ifaceCounters(row, &counters)) return -EPROTO;
++        if (active != 0) {
++            std::array<int64_t, 4> live;
++            if (!ifaceCounters(row, &live)) return -EPROTO;
++            for (size_t i = 0; i < counters.size(); ++i) {
++                if (live[i] > INT64_MAX - counters[i]) return -EOVERFLOW;
++                counters[i] += live[i];
++            }
++        }
++        // As in the legacy platform reader, ignore extra columns, including
++        // live counters on inactive interfaces. Never add those twice.
++        entry.rxBytes = counters[0];
++        entry.rxPackets = counters[1];
++        entry.txBytes = counters[2];
++        entry.txPackets = counters[3];
++        parsed.push_back(std::move(entry));
++    }
++    if (input.bad() || (!input.eof() && input.fail())) return -EIO;
++    output->swap(parsed);
++    return 0;
++}
++}  // namespace trona::network
+diff --git a/server/trona/LegacyQtaguidStats.h b/server/trona/LegacyQtaguidStats.h
+new file mode 100644
+index 0000000..1fb8a3a
+--- /dev/null
++++ b/server/trona/LegacyQtaguidStats.h
+@@ -0,0 +1,40 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++#include <cstdint>
++#include <istream>
++#include <string>
++#include <vector>
++
++namespace trona::network {
++// Raw cumulative counters. These are NOT the incremental BPF samples consumed by
++// Android 17 NetworkStatsFactory. No reset/delta, VPN, CLAT, or filtering here.
++struct QtaguidStatsEntry {
++    std::string iface;
++    int32_t uid;
++    int32_t set;
++    int32_t tag;
++    int64_t rxBytes;
++    int64_t rxPackets;
++    int64_t txBytes;
++    int64_t txPackets;
++    // Keep the complete proc tag for consumers (TrafficStats) that test raw
++    // tag zero. NetworkStats uses the separate signed upper-32-bit tag above.
++    uint64_t rawTag = 0;
++};
++
++// Parse the standard xt_qtaguid stats text. Publish a complete result only on
++// success. Return negative errno on malformed input/read failure; never replace
++// the caller's previous data with an empty or partial successful snapshot.
++// An empty, valid header-only snapshot is legitimate. Caller owns/opened the stream
++// and must leave its exception mask disabled (Android builds without exceptions).
++int ReadQtaguidStats(std::istream& input, std::vector<QtaguidStatsEntry>* output);
++
++enum class QtaguidIfaceFormat { All, Formatted };
++
++// Interface totals use UID_ALL/SET_ALL (-1) and TAG_NONE (0). All is the
++// headerless iface_stat_all format: saved counters plus live counters only when
++// active. Formatted is iface_stat_fmt (IP-layer totals with a header).
++// Same stream/error/publication contract as ReadQtaguidStats; no file is opened.
++int ReadQtaguidIfaceStats(std::istream& input, QtaguidIfaceFormat format,
++                         std::vector<QtaguidStatsEntry>* output);
++}  // namespace trona::network
+diff --git a/server/trona/MeteredUidController.cpp b/server/trona/MeteredUidController.cpp
+new file mode 100644
+index 0000000..fc8b463
+--- /dev/null
++++ b/server/trona/MeteredUidController.cpp
+@@ -0,0 +1,68 @@
++// SPDX-License-Identifier: Apache-2.0
++#include "MeteredUidController.h"
++#include "MeteredUidPolicy.h"
++#include <cerrno>
++
++namespace trona::network {
++namespace {
++int ValidateChain(int id) {
++    if (!FindChain(id)) return -EINVAL;
++    return id >= 10 && id <= 12 ? 0 : -EOPNOTSUPP;
++}
++}
++int MeteredUidController::Commit(State replacement) {
++    std::string command;
++    int result = BuildMeteredUidPolicy(replacement.users, replacement.members[0],
++            replacement.members[1], replacement.members[2], &command, attribution_);
++    if (result) return result; // Invalid input has not changed the kernel or current state.
++    if (!restore_) return -ENOSYS;
++    result = restore_(command);
++    if (result) {
++        // A failure can follow a successful IPv4 update; all three sets are now unknown.
++        state_.reset();
++        return result > 0 ? -EREMOTEIO : result;
++    }
++    state_ = std::move(replacement);
++    return 0;
++}
++int MeteredUidController::ReplacePolicy(const std::set<int>& users, const std::set<int>& allowed,
++        const std::set<int>& userDenied, const std::set<int>& adminDenied) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    return Commit(State{users, {allowed, userDenied, adminDenied}});
++}
++int MeteredUidController::SetUidRule(int id, int uid, int rule) {
++    int result = ValidateChain(id);
++    if (result) return result;
++    if (uid < 0 || (rule != 1 && rule != 2)) return -EINVAL;
++    if (attribution_ != OwnerAttribution::VerifiedQtaguid) return -EOPNOTSUPP;
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!state_) return -EAGAIN;
++    bool member = id == 10 ? rule == 1 : rule == 2;
++    if ((state_->members[id - 10].count(uid) != 0) == member) return 0;
++    State replacement = *state_;
++    if (member) replacement.members[id - 10].insert(uid);
++    else replacement.members[id - 10].erase(uid);
++    return Commit(std::move(replacement));
++}
++int MeteredUidController::GetUidRule(int id, int uid, int* rule) {
++    int result = ValidateChain(id);
++    if (result) return result;
++    if (uid < 0 || !rule) return -EINVAL;
++    if (attribution_ != OwnerAttribution::VerifiedQtaguid) return -EOPNOTSUPP;
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!state_) return -EAGAIN;
++    bool member = state_->members[id - 10].count(uid) != 0;
++    *rule = member == (id == 10) ? 1 : 2;
++    return 0;
++}
++int MeteredUidController::RemoveUid(int uid) {
++    if (uid < 0) return -EINVAL;
++    if (attribution_ != OwnerAttribution::VerifiedQtaguid) return -EOPNOTSUPP;
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!state_) return -EAGAIN;
++    State replacement = *state_;
++    bool changed = false;
++    for (auto& members : replacement.members) changed |= members.erase(uid) != 0;
++    return changed ? Commit(std::move(replacement)) : 0;
++}
++}
+diff --git a/server/trona/MeteredUidController.h b/server/trona/MeteredUidController.h
+new file mode 100644
+index 0000000..51b03fd
+--- /dev/null
++++ b/server/trona/MeteredUidController.h
+@@ -0,0 +1,42 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++#include "LegacyFirewallRules.h"
++#include <array>
++#include <functional>
++#include <mutex>
++#include <optional>
++#include <set>
++#include <string>
++#include <utility>
++
++namespace trona::network {
++// Owns membership for one unhooked metered policy chain. The caller must replay
++// complete policy on startup or after ANY restore failure before enabling hooks.
++// Restore must preserve other chains, apply IPv4+IPv6, and never throw or reenter.
++// Other writers must not mutate this owned chain while its cached state is used.
++// No interface hooks, Data Saver lifecycle, persistence or attribution probe here.
++class MeteredUidController {
++public:
++    using Restore = std::function<int(const std::string&)>;
++    explicit MeteredUidController(Restore restore,
++            OwnerAttribution attribution = OwnerAttribution::Unverified)
++        : restore_(std::move(restore)), attribution_(attribution) {}
++    int ReplacePolicy(const std::set<int>& users, const std::set<int>& allowed,
++                      const std::set<int>& userDenied, const std::set<int>& adminDenied);
++    int SetUidRule(int chain, int uid, int rule);
++    // Reports explicit membership, not an effective packet decision or core exemption.
++    int GetUidRule(int chain, int uid, int* rule);
++    int RemoveUid(int uid);
++private:
++    struct State {
++        std::set<int> users;
++        // Android 17 chain IDs 10, 11, 12: allow, user deny, admin deny.
++        std::array<std::set<int>, 3> members;
++    };
++    int Commit(State replacement); // mutex_ held; publishes only after successful restore.
++    Restore restore_;
++    const OwnerAttribution attribution_;
++    std::mutex mutex_;
++    std::optional<State> state_;
++};
++}
+diff --git a/server/trona/MeteredUidPolicy.cpp b/server/trona/MeteredUidPolicy.cpp
+new file mode 100644
+index 0000000..8c4c999
+--- /dev/null
++++ b/server/trona/MeteredUidPolicy.cpp
+@@ -0,0 +1,45 @@
++// SPDX-License-Identifier: Apache-2.0
++#include "MeteredUidPolicy.h"
++#include <cerrno>
++#include <utility>
++
++namespace trona::network {
++int BuildMeteredUidPolicy(const std::set<int>& users, const std::set<int>& allowed,
++                          const std::set<int>& userDenied, const std::set<int>& adminDenied,
++                          std::string* output, OwnerAttribution attribution) {
++    if (!output) return -EINVAL;
++    output->clear();
++    if (!users.count(0)) return -EINVAL;
++    for (int user : users) if (user < 0 || user > 21474) return -EINVAL;
++    for (const auto* members : {&allowed, &userDenied, &adminDenied}) {
++        for (int uid : *members) if (uid < 0) return -EINVAL;
++    }
++    if (attribution != OwnerAttribution::VerifiedQtaguid) return -EOPNOTSUPP;
++
++    std::set<int> denied = userDenied;
++    denied.insert(adminDenied.begin(), adminDenied.end());
++    const std::string append = "-A tr_metered ";
++    std::string command = "*filter\n:tr_metered -\n-F tr_metered\n";
++    // Unlike nonmetered firewall policy, explicit denial precedes core UID exemptions.
++    for (int uid : denied) {
++        command += append + "-m owner --uid-owner " + std::to_string(uid) + " -j REJECT\n";
++    }
++    // The target BPF matcher exposes ownerless packets as overflow UID 65534.
++    // This equivalence must be proven on the retained qtaguid provider before use.
++    command += append + "-m owner ! --uid-owner 0-4294967294 -j " +
++               (denied.count(65534) ? "REJECT\n" : "RETURN\n");
++    command += append + "-m owner --uid-owner 65534 -j RETURN\n";
++    for (int user : users) {
++        const long long first = static_cast<long long>(user) * 100000;
++        command += append + "-m owner --uid-owner " + std::to_string(first) + "-" +
++                   std::to_string(first + 9999) + " -j RETURN\n";
++    }
++    for (int uid : allowed) {
++        command += append + "-m owner --uid-owner " + std::to_string(uid) + " -j RETURN\n";
++    }
++    // Keep Data Saver's native IPv6-critical rules; do not replace them with a raw DROP.
++    command += append + "-j bw_data_saver\nCOMMIT\n";
++    *output = std::move(command);
++    return 0;
++}
++}
+diff --git a/server/trona/MeteredUidPolicy.h b/server/trona/MeteredUidPolicy.h
+new file mode 100644
+index 0000000..7e0f857
+--- /dev/null
++++ b/server/trona/MeteredUidPolicy.h
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++#include "LegacyFirewallRules.h"
++#include <set>
++#include <string>
++
++namespace trona::network {
++// Rebuilds one owned, unhooked chain. Future callers must supply every active user,
++// keep user/admin deny state independently, and attach only on costly interfaces
++// preserving each native hook's quota/policy ordering (shared and per-interface differ).
++// bw_data_saver must already exist with native IPv6 exceptions.
++// This does not implement lifecycle, Data Saver updates, accounting or packet attribution.
++int BuildMeteredUidPolicy(const std::set<int>& users, const std::set<int>& allowed,
++                          const std::set<int>& userDenied, const std::set<int>& adminDenied,
++                          std::string* output,
++                          OwnerAttribution attribution = OwnerAttribution::Unverified);
++}
+diff --git a/server/trona/NetdRestoreAdapter.cpp b/server/trona/NetdRestoreAdapter.cpp
+new file mode 100644
+index 0000000..d42743d
+--- /dev/null
++++ b/server/trona/NetdRestoreAdapter.cpp
+@@ -0,0 +1,13 @@
++// SPDX-License-Identifier: Apache-2.0
++#include "NetdRestoreAdapter.h"
++#include <cerrno>
++#include <memory>
++#include "NetdConstants.h"
++
++namespace trona::network {
++int RestoreViaNetd(const std::string& command) {
++    // netd currently returns 0/-1 without an errno guarantee. Do not interpret -1
++    // as EPERM or use stale errno after sequential IPv4 and IPv6 execution.
++    return ::execIptablesRestore(V4V6, command) == 0 ? 0 : -EREMOTEIO;
++}
++}
+diff --git a/server/trona/NetdRestoreAdapter.h b/server/trona/NetdRestoreAdapter.h
+new file mode 100644
+index 0000000..8145598
+--- /dev/null
++++ b/server/trona/NetdRestoreAdapter.h
+@@ -0,0 +1,10 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++#include <string>
++
++namespace trona::network {
++// For future netd integration only, after gCtls->iptablesRestoreCtrl initialization.
++// Calls the existing serialized V4V6 executor; the two families are not atomic.
++// Not linked into the active build; host tests replace the command-execution boundary.
++int RestoreViaNetd(const std::string& command);
++}
+diff --git a/server/trona/RetainedNetworkEvidence.h b/server/trona/RetainedNetworkEvidence.h
+new file mode 100644
+index 0000000..b556163
+--- /dev/null
++++ b/server/trona/RetainedNetworkEvidence.h
+@@ -0,0 +1,33 @@
++// SPDX-License-Identifier: Apache-2.0
++// Generated from pinned existing evidence; not runtime kernel attestation.
++#pragma once
++namespace trona::network {
++inline constexpr char kRetainedMeasuredKernel[] = "4.4.302-lineage-trona17wifiapi1";
++// Any Fire HD 10 (2021) running its retained vendor partition (ro.product.vendor.device).
++inline constexpr char kRetainedVendorDevice[] = "trona";
++inline constexpr char kRetainedStatsHeader[] = "idx iface acct_tag_hex uid_tag_int cnt_set rx_bytes rx_packets tx_bytes tx_packets rx_tcp_bytes rx_tcp_packets rx_udp_bytes rx_udp_packets rx_other_bytes rx_other_packets tx_tcp_bytes tx_tcp_packets tx_udp_bytes tx_udp_packets tx_other_bytes tx_other_packets";
++inline constexpr char kRetainedIfaceHeader[] = "ifname total_skb_rx_bytes total_skb_rx_packets total_skb_tx_bytes total_skb_tx_packets rx_tcp_bytes rx_tcp_packets rx_udp_bytes rx_udp_packets rx_other_bytes rx_other_packets tx_tcp_bytes tx_tcp_packets tx_udp_bytes tx_udp_packets tx_other_bytes tx_other_packets";
++inline constexpr char kRetainedOwnerEvidenceSha256[] = "e2e0c5cddf97c01c667c28a779de9e874377ad9647fbc61639a027815ffaea2b";
++inline constexpr char kRetainedMutationEvidenceSha256[] = "1c5cc14e4c6f320299cc73456147ae13d4015e2c728d4cdf405e4a499027e35b";
++inline constexpr char kRetainedPrerequisiteEvidenceSha256[] = "ef4040730a7404690492c400886a40f4d24eb7ae6722aa53f9dfe47b3443e6d9";
++inline constexpr char kRetainedRestoreInput[] = R"retained(*filter
++:tr_verify_preflight - [0:0]
++-A tr_verify_preflight -m owner --socket-exists -j RETURN
++-A tr_verify_preflight -m owner --uid-owner 0 -j RETURN
++-A tr_verify_preflight -m quota2 --name tr_verify_quota --quota 1 -j RETURN
++-A tr_verify_preflight -m mark --mark 0x100000/0x100000 -j RETURN
++-A tr_verify_preflight -m comment --comment "trona prerequisites" -j RETURN
++-A tr_verify_preflight -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
++-A tr_verify_preflight -j REJECT
++COMMIT
++*raw
++:tr_verify_preflight - [0:0]
++-A tr_verify_preflight -m policy --pol ipsec --dir in -j RETURN
++COMMIT
++*mangle
++:tr_verify_preflight - [0:0]
++-A tr_verify_preflight -m policy --pol ipsec --dir out -j RETURN
++-A tr_verify_preflight -j MARK --or-mark 0x100000
++COMMIT
++)retained";
++}
+diff --git a/server/trona/RetainedNetworkPrerequisites.cpp b/server/trona/RetainedNetworkPrerequisites.cpp
+new file mode 100644
+index 0000000..b054a60
+--- /dev/null
++++ b/server/trona/RetainedNetworkPrerequisites.cpp
+@@ -0,0 +1,118 @@
++// SPDX-License-Identifier: Apache-2.0
++#include "RetainedNetworkPrerequisitesProbe.h"
++#include "RetainedNetworkEvidence.h"
++#include "LegacyQtaguidStats.h"
++#include <algorithm>
++#include <cerrno>
++#include <charconv>
++#include <set>
++#include <sstream>
++#include <string_view>
++#include <vector>
++
++namespace trona::network {
++namespace {
++constexpr size_t kMaxProcBytes = 4 * 1024 * 1024;
++int status(int value) { return value > 0 ? -EIO : value; }
++std::vector<std::string> words(const std::string& line) {
++    std::istringstream stream(line); std::vector<std::string> result;
++    for (std::string word; stream >> word;) result.push_back(word);
++    return result;
++}
++bool number(const std::string& value) {
++    if (value.empty() || value[0] == '+' || value[0] == '-') return false;
++    uint64_t parsed; auto result = std::from_chars(value.data(), value.data()+value.size(), parsed);
++    return result.ec == std::errc{} && result.ptr == value.data()+value.size();
++}
++int snapshot(const RetainedPrerequisiteProbe& p, RetainedText input, std::string* text) {
++    int result = status(p.read(input, text, p.context)); if (result) return result;
++    if (text->size() > kMaxProcBytes) return -EFBIG;
++    if (text->find('\0') != std::string::npos) return -EINVAL;
++    return 0;
++}
++int exactRows(const std::string& text, const char* header, size_t columns,
++              bool detailed) {
++    // The headerless interface table can legitimately have no entries before
++    // NETDEV_UP/address notification. Header-bearing formats must retain theirs.
++    if (text.empty()) return header ? -EPROTO : 0;
++    if (text.back() != '\n') return -EPROTO;
++    std::istringstream stream(text); std::string line;
++    if (header && (!std::getline(stream,line) || words(line) != words(header))) return -EPROTO;
++    while (std::getline(stream,line)) {
++        auto row = words(line); if (row.size() != columns) return -EPROTO;
++        for (size_t i = detailed ? 0 : 1; i < row.size(); ++i) {
++            if (detailed && (i == 1 || i == 2)) continue;
++            if (!number(row[i])) return -EINVAL;
++        }
++    }
++    return stream.bad() ? -EIO : 0;
++}
++bool has(const std::string& text, std::initializer_list<const char*> required) {
++    auto tokens = words(text); std::set<std::string> values(tokens.begin(),tokens.end());
++    for (const auto* token : required) if (!values.count(token)) return false;
++    return true;
++}
++}  // namespace
++
++int VerifyRetainedNetworkPrerequisitesWithProbe(const RetainedPrerequisiteProbe& p,
++                                               OwnerAttribution* out) noexcept {
++    if (!out || !p.requested || !p.read || !p.controlOpen || !p.trackerOpen || !p.restoreTest) return -EINVAL;
++    RequestedNetworkBackend backend;
++    int result = status(p.requested(&backend,p.context)); if (result) return result;
++    // The shared frozen selector validates the trona vendor identity for legacy.
++    if (backend != RequestedNetworkBackend::TronaLegacy) return -EOPNOTSUPP;
++    std::string text;
++    if ((result = snapshot(p,RetainedText::KernelRelease,&text))) return result;
++    if (text != kRetainedMeasuredKernel) return -EOPNOTSUPP;
++    if ((result = snapshot(p,RetainedText::BootSerial,&text))) return result;
++    if (text != kRetainedVendorDevice) return -ENODEV;
++    std::vector<QtaguidStatsEntry> rows;
++    if ((result = snapshot(p,RetainedText::Stats,&text))) return result;
++    if ((result = exactRows(text,kRetainedStatsHeader,21,true))) return result;
++    std::istringstream stats(text);
++    if ((result = ReadQtaguidStats(stats,&rows))) return result;
++    if ((result = snapshot(p,RetainedText::IfaceAll,&text))) return result;
++    if ((result = exactRows(text,nullptr,10,false))) return result;
++    const bool ifaceTableEmpty = text.empty();
++    std::istringstream all(text);
++    if ((result = ReadQtaguidIfaceStats(all,QtaguidIfaceFormat::All,&rows))) return result;
++    if ((result = snapshot(p,RetainedText::IfaceFormatted,&text))) return result;
++    // The kernel writes this header in seq start, and seq_read discards it when
++    // the interface list has no record: the state before "ifup lo" in on boot.
++    if (!ifaceTableEmpty || !text.empty()) {
++        if ((result = exactRows(text,kRetainedIfaceHeader,17,false))) return result;
++        std::istringstream formatted(text);
++        if ((result = ReadQtaguidIfaceStats(formatted,QtaguidIfaceFormat::Formatted,&rows))) return result;
++    }
++    for (auto input : {RetainedText::Matches4,RetainedText::Matches6}) {
++        if ((result = snapshot(p,input,&text))) return result;
++        if (!has(text,{"owner","quota2","policy","mark","comment","conntrack"})) return -EOPNOTSUPP;
++    }
++    for (auto input : {RetainedText::Tables4,RetainedText::Tables6}) {
++        if ((result = snapshot(p,input,&text))) return result;
++        if (!has(text,{"filter","raw","mangle"}) ||
++            (input == RetainedText::Tables4 && !has(text,{"nat"}))) return -EOPNOTSUPP;
++    }
++    for (auto input : {RetainedText::Targets4,RetainedText::Targets6}) {
++        if ((result = snapshot(p,input,&text))) return result;
++        if (!has(text,{"MARK","REJECT","CONNMARK"})) return -EOPNOTSUPP;
++    }
++    if ((result = status(p.controlOpen(p.context)))) return result;
++    if ((result = status(p.trackerOpen(p.context)))) return result;
++    for (auto input : {RetainedText::RestoreHelp4,RetainedText::RestoreHelp6}) {
++        if ((result = snapshot(p,input,&text))) return result;
++        if (!has(text,{"--test","--noflush"})) return -EOPNOTSUPP;
++        const auto options = words(text);
++        if (!std::any_of(options.begin(),options.end(),[](const auto& option) {
++                return option == "--wait" || option.compare(0,7,"--wait=") == 0;
++            })) return -EOPNOTSUPP;
++    }
++    for (bool ipv6 : {false,true}) {
++        if ((result = status(p.restoreTest(ipv6,kRetainedRestoreInput,p.context)))) return result;
++    }
++    // This is the pinned measured retained-kernel acceptance, not a deduction
++    // that mere registry entries or --test prove packet/kernel checkentry behavior.
++    *out = OwnerAttribution::VerifiedQtaguid;
++    return 0;
++}
++}  // namespace trona::network
+diff --git a/server/trona/RetainedNetworkPrerequisites.h b/server/trona/RetainedNetworkPrerequisites.h
+new file mode 100644
+index 0000000..a1b0bd8
+--- /dev/null
++++ b/server/trona/RetainedNetworkPrerequisites.h
+@@ -0,0 +1,10 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++#include "LegacyFirewallRules.h"
++namespace trona::network {
++// Narrow bring-up acceptance for the pinned development serial/retained kernel.
++// Success relies on the separately pinned measured owner evidence; these runtime
++// reads/parser tests alone are not packet attribution or Android17 proof.
++// Zero publishes VerifiedQtaguid; negative errno leaves *out untouched.
++int VerifyRetainedNetworkPrerequisites(OwnerAttribution* out) noexcept;
++}  // namespace trona::network
+diff --git a/server/trona/RetainedNetworkPrerequisitesIo.cpp b/server/trona/RetainedNetworkPrerequisitesIo.cpp
+new file mode 100644
+index 0000000..a19992f
+--- /dev/null
++++ b/server/trona/RetainedNetworkPrerequisitesIo.cpp
+@@ -0,0 +1,176 @@
++// SPDX-License-Identifier: Apache-2.0
++#include "RetainedNetworkPrerequisitesProbe.h"
++#include "RetainedNetworkEvidence.h"
++#include <android-base/properties.h>
++#include <algorithm>
++#include <cerrno>
++#include <chrono>
++#include <csignal>
++#include <cstring>
++#include <fcntl.h>
++#include <poll.h>
++#include <spawn.h>
++#include <sys/stat.h>
++#include <sys/utsname.h>
++#include <sys/wait.h>
++#include <unistd.h>
++extern char** environ;
++
++namespace trona::network {
++namespace {
++constexpr size_t kMaxProcBytes = 4 * 1024 * 1024;
++constexpr size_t kMaxCommandOutput = 64 * 1024;
++constexpr int kCommandDeadlineMs = 5000;
++struct Fd {
++    int fd = -1;
++    explicit Fd(int value = -1) : fd(value) {}
++    ~Fd() { if (fd >= 0) close(fd); }
++    void reset() { if (fd >= 0) close(fd); fd = -1; }
++};
++int readFile(const char* path, std::string* out) {
++    Fd fd(open(path,O_RDONLY|O_CLOEXEC|O_NOFOLLOW));
++    if (fd.fd < 0) return -errno;
++    std::string value; char buffer[4096];
++    for (;;) {
++        ssize_t count = read(fd.fd,buffer,sizeof(buffer));
++        if (count < 0) { if (errno == EINTR) continue; return -errno; }
++        if (count == 0) break;
++        if (value.size()+size_t(count) > kMaxProcBytes) return -EFBIG;
++        value.append(buffer,size_t(count));
++    }
++    *out = std::move(value); return 0;
++}
++int safeOpen(const char* path, bool character) {
++    Fd fd(open(path,(character?O_RDONLY:O_WRONLY)|O_CLOEXEC|O_NOFOLLOW));
++    if (fd.fd < 0) return -errno;
++    struct stat value;
++    if (fstat(fd.fd,&value)) return -errno;
++    if (character ? !S_ISCHR(value.st_mode) : !S_ISREG(value.st_mode)) return -ENODEV;
++    return 0; // Closing the tracker/control; no control bytes are ever written.
++}
++
++// Only --help and the fixed no-commit --test argv exist in production.
++// Input is prefilled before spawn while its read end is owned, avoiding SIGPIPE
++// and a blocking parent write to an unresponsive child. The fixed input fits one
++// Linux PIPE_BUF (4096) on the explicitly retained kernel.
++int runRestore(const char* binary, bool help, const std::string& input,
++               std::string* output, int timeoutMs) {
++    if (!output || timeoutMs <= 0 || input.size() >= 4096) return -EINVAL;
++    int inPipe[2], outPipe[2];
++    if (pipe2(inPipe,O_CLOEXEC)) return -errno;
++    Fd inRead(inPipe[0]), inWrite(inPipe[1]);
++    if (pipe2(outPipe,O_CLOEXEC)) return -errno;
++    Fd outRead(outPipe[0]), outWrite(outPipe[1]);
++    if (!input.empty()) {
++        ssize_t count;
++        do { count = write(inWrite.fd,input.data(),input.size()); } while (count < 0 && errno == EINTR);
++        if (count < 0) return -errno;
++        if (size_t(count) != input.size()) return -EIO;
++    }
++    inWrite.reset();
++    posix_spawn_file_actions_t actions;
++    int error = posix_spawn_file_actions_init(&actions);
++    if (error) return -error;
++    error = posix_spawn_file_actions_adddup2(&actions,inRead.fd,STDIN_FILENO);
++    if (!error) error = posix_spawn_file_actions_adddup2(&actions,outWrite.fd,STDOUT_FILENO);
++    if (!error) error = posix_spawn_file_actions_adddup2(&actions,outWrite.fd,STDERR_FILENO);
++    for (int fd : {inRead.fd,outRead.fd,outWrite.fd}) {
++        if (!error && fd > STDERR_FILENO) error = posix_spawn_file_actions_addclose(&actions,fd);
++    }
++    char* helpArgs[] = {const_cast<char*>(binary),const_cast<char*>("--help"),nullptr};
++    char* testArgs[] = {const_cast<char*>(binary),const_cast<char*>("--test"),
++        const_cast<char*>("--noflush"),const_cast<char*>("--wait"),const_cast<char*>("2"),nullptr};
++    pid_t child = -1;
++    if (!error) error = posix_spawn(&child,binary,&actions,nullptr,help?helpArgs:testArgs,environ);
++    posix_spawn_file_actions_destroy(&actions);
++    if (error) return -error;
++    inRead.reset(); outWrite.reset();
++    bool reaped = false; int childStatus = 0;
++    const auto finishError = [&](int result) {
++        if (!reaped) {
++            kill(child,SIGKILL); // Only the unreaped owned child PID can be signalled.
++            pid_t waited; do { waited = waitpid(child,&childStatus,0); } while (waited < 0 && errno == EINTR);
++        }
++        return result;
++    };
++    int flags = fcntl(outRead.fd,F_GETFL);
++    if (flags < 0 || fcntl(outRead.fd,F_SETFL,flags|O_NONBLOCK)) return finishError(-errno);
++    const auto deadline = std::chrono::steady_clock::now()+std::chrono::milliseconds(timeoutMs);
++    std::string value; bool eof = false;
++    for (;;) {
++        char buffer[4096];
++        for (;;) {
++            ssize_t count = read(outRead.fd,buffer,sizeof(buffer));
++            if (count < 0) { if (errno == EINTR) continue; if (errno == EAGAIN) break; return finishError(-errno); }
++            if (count == 0) { eof = true; break; }
++            if (value.size()+size_t(count) > kMaxCommandOutput) return finishError(-EFBIG);
++            value.append(buffer,size_t(count));
++        }
++        if (!reaped) {
++            pid_t waited = waitpid(child,&childStatus,WNOHANG);
++            if (waited == child) reaped = true;
++            else if (waited < 0 && errno != EINTR) {
++                const int result = -errno;
++                // Another reaper/SA_NOCLDWAIT may have consumed the child.
++                // Its numeric PID is no longer ours to signal after ECHILD.
++                if (errno == ECHILD) reaped = true;
++                return finishError(result);
++            }
++        }
++        if (reaped && eof) {
++            if (!WIFEXITED(childStatus) || WEXITSTATUS(childStatus)) return -EREMOTEIO;
++            *output = std::move(value); return 0;
++        }
++        if (std::chrono::steady_clock::now() >= deadline) return finishError(-ETIMEDOUT);
++        struct pollfd descriptor {outRead.fd,POLLIN|POLLHUP,0};
++        if (poll(eof?nullptr:&descriptor,eof?0:1,25) < 0 && errno != EINTR) return finishError(-errno);
++    }
++}
++int requested(RequestedNetworkBackend* out,void*) noexcept { return GetRequestedNetworkBackend(out); }
++int readText(RetainedText input,std::string* out,void*) noexcept {
++    switch (input) {
++        case RetainedText::KernelRelease: {
++            struct utsname value; if (uname(&value)) return -errno;
++            *out = value.release; return 0;
++        }
++        case RetainedText::BootSerial: *out = android::base::GetProperty("ro.product.vendor.device",""); return 0;
++        case RetainedText::RestoreHelp4: return runRestore("/system/bin/iptables-restore",true,"",out,kCommandDeadlineMs);
++        case RetainedText::RestoreHelp6: return runRestore("/system/bin/ip6tables-restore",true,"",out,kCommandDeadlineMs);
++        default: break;
++    }
++    const char* path = nullptr;
++    switch (input) {
++        case RetainedText::Stats: path="/proc/net/xt_qtaguid/stats"; break;
++        case RetainedText::IfaceAll: path="/proc/net/xt_qtaguid/iface_stat_all"; break;
++        case RetainedText::IfaceFormatted: path="/proc/net/xt_qtaguid/iface_stat_fmt"; break;
++        case RetainedText::Matches4: path="/proc/net/ip_tables_matches"; break;
++        case RetainedText::Matches6: path="/proc/net/ip6_tables_matches"; break;
++        case RetainedText::Tables4: path="/proc/net/ip_tables_names"; break;
++        case RetainedText::Tables6: path="/proc/net/ip6_tables_names"; break;
++        case RetainedText::Targets4: path="/proc/net/ip_tables_targets"; break;
++        case RetainedText::Targets6: path="/proc/net/ip6_tables_targets"; break;
++        default: return -EINVAL;
++    }
++    return readFile(path,out);
++}
++int openControl(void*) noexcept { return safeOpen("/proc/net/xt_qtaguid/ctrl",false); }
++int openTracker(void*) noexcept { return safeOpen("/dev/xt_qtaguid",true); }
++int restoreTest(bool ipv6,const std::string& input,void*) noexcept {
++    if (input != kRetainedRestoreInput) return -EINVAL;
++    std::string output;
++    return runRestore(ipv6?"/system/bin/ip6tables-restore":"/system/bin/iptables-restore",
++                      false,input,&output,kCommandDeadlineMs);
++}
++}  // namespace
++int VerifyRetainedNetworkPrerequisites(OwnerAttribution* out) noexcept {
++    const RetainedPrerequisiteProbe probe {requested,readText,openControl,openTracker,restoreTest,nullptr};
++    return VerifyRetainedNetworkPrerequisitesWithProbe(probe,out);
++}
++#ifdef TRONA_RETAINED_PREREQUISITES_TEST
++int RunRetainedRestoreForTest(const char* binary,bool help,const std::string& input,
++                             std::string* output,int deadlineMs) {
++    return runRestore(binary,help,input,output,deadlineMs);
++}
++int OpenRetainedPathForTest(const char* path,bool character) { return safeOpen(path,character); }
++#endif
++}  // namespace trona::network
+diff --git a/server/trona/RetainedNetworkPrerequisitesProbe.h b/server/trona/RetainedNetworkPrerequisitesProbe.h
+new file mode 100644
+index 0000000..2659b5a
+--- /dev/null
++++ b/server/trona/RetainedNetworkPrerequisitesProbe.h
+@@ -0,0 +1,21 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++#include "RetainedNetworkPrerequisites.h"
++#include <trona/NativeNetworkProfile.h>
++#include <string>
++namespace trona::network {
++enum class RetainedText { KernelRelease, BootSerial, Stats, IfaceAll, IfaceFormatted,
++    Matches4, Matches6, Tables4, Tables6, Targets4, Targets6, RestoreHelp4, RestoreHelp6 };
++// Fixed-purpose injected boundary for host checks; production supplies only the
++// fixed paths and --help/--test operations below, never arbitrary commands.
++struct RetainedPrerequisiteProbe {
++    int (*requested)(RequestedNetworkBackend*, void*) noexcept;
++    int (*read)(RetainedText, std::string*, void*) noexcept;
++    int (*controlOpen)(void*) noexcept;
++    int (*trackerOpen)(void*) noexcept;
++    int (*restoreTest)(bool ipv6, const std::string&, void*) noexcept;
++    void* context;
++};
++int VerifyRetainedNetworkPrerequisitesWithProbe(const RetainedPrerequisiteProbe&,
++                                               OwnerAttribution*) noexcept;
++}  // namespace trona::network
+diff --git a/server/trona/UidRuleController.cpp b/server/trona/UidRuleController.cpp
+new file mode 100644
+index 0000000..463f7d0
+--- /dev/null
++++ b/server/trona/UidRuleController.cpp
+@@ -0,0 +1,157 @@
++// SPDX-License-Identifier: Apache-2.0
++#include "UidRuleController.h"
++#include "LegacyFirewallRules.h"
++#include <cerrno>
++namespace trona::network {
++namespace {
++int ValidateChain(int id) {
++    const Chain* chain = FindChain(id);
++    return !chain ? -EINVAL : chain->metered ? -EOPNOTSUPP : 0;
++}
++int NormalizeResult(int result) { return result > 0 ? -EREMOTEIO : result; }
++std::string ChainBody(int id, const std::set<int>& members) {
++    const Chain* chain = FindChain(id);
++    std::string body = std::string(":") + chain->name + " -\n-F " + chain->name + "\n";
++    for (int uid : members) {
++        body += std::string("-A ") + chain->name + " -m owner --uid-owner " +
++                std::to_string(uid) + " -j " + (chain->allowlist ? "RETURN\n" : "DROP\n");
++    }
++    if (chain->allowlist) body += std::string("-A ") + chain->name + " -j DROP\n";
++    return body;
++}
++int DispatchBody(const std::set<int>& users, const std::set<int>& enabled,
++                 OwnerAttribution attribution, std::string* output) {
++    output->clear();
++    const std::string header = "*filter\n", footer = "COMMIT\n";
++    for (Direction direction : {Direction::Ingress, Direction::Egress}) {
++        std::string section;
++        int result = BuildPacketDispatch(direction, users, enabled, &section, attribution);
++        if (result) return result;
++        // Merge only our own generator's filter sections into the caller's transaction.
++        if (section.size() < header.size() + footer.size() ||
++            section.compare(0, header.size(), header) != 0 ||
++            section.compare(section.size() - footer.size(), footer.size(), footer) != 0)
++            return -EPROTO;
++        output->append(section, header.size(), section.size() - header.size() - footer.size());
++    }
++    return 0;
++}
++}
++int UidRuleController::InitializeEmptyChain(int id) {
++    return ReplaceUidChain(id, {});
++}
++int UidRuleController::ReplaceUidChain(int id, const std::vector<int>& members) {
++    int result = ValidateChain(id);
++    if (result) return result;
++    State replacement;
++    for (int uid : members) {
++        if (uid < 0) return -EINVAL;
++        replacement.members.insert(uid);
++    }
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (ownsDispatch_ && !dispatch_) return -EAGAIN;
++    if (!restore_) return -ENOSYS;
++    std::string command = "*filter\n" + ChainBody(id, replacement.members) + "COMMIT\n";
++    result = NormalizeResult(restore_(command));
++    if (result) InvalidateAfterFailure(id);
++    else states_[id] = std::move(replacement);
++    return result;
++}
++int UidRuleController::SetUidRule(int id, int uid, int rule) {
++    std::string command;
++    int result = BuildUidRuleUpdate(id, uid, rule, &command);
++    if (result) return result;
++    std::lock_guard<std::mutex> lock(mutex_);
++    auto state = states_.find(id);
++    if (state == states_.end()) return -EAGAIN;
++    bool member = FindChain(id)->allowlist ? rule == 1 : rule == 2;
++    if ((state->second.members.count(uid) != 0) == member) return 0;
++    result = NormalizeResult(restore_(command));
++    if (result) {
++        // IPv4 may have changed even when IPv6 failed. Never reuse an assumed state.
++        InvalidateAfterFailure(id);
++        return result;
++    }
++    if (member) state->second.members.insert(uid);
++    else state->second.members.erase(uid);
++    return 0;
++}
++int UidRuleController::GetUidRule(int id, int uid, int* rule) {
++    int result = ValidateChain(id);
++    if (result) return result;
++    if (uid < 0 || !rule) return -EINVAL;
++    std::lock_guard<std::mutex> lock(mutex_);
++    auto state = states_.find(id);
++    if (state == states_.end()) return -EAGAIN;
++    bool member = state->second.members.count(uid) != 0;
++    *rule = member == FindChain(id)->allowlist ? 1 : 2;
++    return 0;
++}
++void UidRuleController::InvalidateAfterFailure(int id) {
++    if (ownsDispatch_) {
++        states_.clear();
++        dispatch_.reset();
++    } else {
++        states_.erase(id);
++    }
++}
++int UidRuleController::ReplayPolicy(const std::set<int>& users,
++                                  const std::map<int, std::vector<int>>& members,
++                                  const std::set<int>& enabled) {
++    std::map<int, State> replacement;
++    for (const auto& [id, uids] : members) {
++        int result = ValidateChain(id);
++        if (result) return result;
++        auto& target = replacement[id].members;
++        for (int uid : uids) {
++            if (uid < 0) return -EINVAL;
++            target.insert(uid);
++        }
++    }
++    // Nine distinct validated IDs imply the complete current nonmetered chain set.
++    if (replacement.size() != 9) return -EINVAL;
++    std::string dispatchBody;
++    int result = DispatchBody(users, enabled, attribution_, &dispatchBody);
++    if (result) return result;
++    std::string command = "*filter\n";
++    for (const auto& [id, state] : replacement) command += ChainBody(id, state.members);
++    command += dispatchBody + "COMMIT\n";
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!restore_) return -ENOSYS;
++    ownsDispatch_ = true;
++    result = NormalizeResult(restore_(command));
++    if (result) {
++        InvalidateAfterFailure(0);
++        return result;
++    }
++    states_ = std::move(replacement);
++    dispatch_ = Dispatch{users, enabled};
++    return 0;
++}
++int UidRuleController::SetChildChain(int id, bool enabled) {
++    int result = ValidateChain(id);
++    if (result) return result;
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!dispatch_) return -EAGAIN;
++    if ((dispatch_->enabled.count(id) != 0) == enabled) return 0;
++    auto replacement = dispatch_->enabled;
++    if (enabled) replacement.insert(id);
++    else replacement.erase(id);
++    std::string body;
++    result = DispatchBody(dispatch_->users, replacement, attribution_, &body);
++    if (result) return result;
++    result = NormalizeResult(restore_("*filter\n" + body + "COMMIT\n"));
++    if (result) InvalidateAfterFailure(id);
++    else dispatch_->enabled = std::move(replacement);
++    return result;
++}
++int UidRuleController::GetChildChainEnabled(int id, bool* enabled) {
++    int result = ValidateChain(id);
++    if (result) return result;
++    if (!enabled) return -EINVAL;
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!dispatch_) return -EAGAIN;
++    *enabled = dispatch_->enabled.count(id) != 0;
++    return 0;
++}
++}
+diff --git a/server/trona/UidRuleController.h b/server/trona/UidRuleController.h
+new file mode 100644
+index 0000000..6fa7e97
+--- /dev/null
++++ b/server/trona/UidRuleController.h
+@@ -0,0 +1,50 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++#include "LegacyFirewallRules.h"
++#include <functional>
++#include <map>
++#include <mutex>
++#include <optional>
++#include <set>
++#include <string>
++#include <utility>
++#include <vector>
++
++namespace trona::network {
++// Owns nonmetered membership and optional unhooked packet dispatch. Native Controllers
++// owns top-level hooks; metered policy, persistence and framework routing are separate.
++// Restore must not throw, must preserve unrelated rules and apply IPv4+IPv6, and must
++// never reenter this controller. The eventual Android executor uses errno returns.
++// Other writers must not modify these chains; after native reset, discard this instance
++// and replay an authoritative complete snapshot before enabling hooks.
++class UidRuleController {
++public:
++    using Restore = std::function<int(const std::string&)>;
++    explicit UidRuleController(Restore restore,
++            OwnerAttribution attribution = OwnerAttribution::Unverified)
++        : restore_(std::move(restore)), attribution_(attribution) {}
++    int InitializeEmptyChain(int chain);
++    // Replaces membership completely; duplicates are normalized before execution.
++    int ReplaceUidChain(int chain, const std::vector<int>& members);
++    int SetUidRule(int chain, int uid, int rule);
++    int GetUidRule(int chain, int uid, int* rule);
++    // Requires explicit membership for ALL nine nonmetered chains and verified attribution.
++    // Rebuilds membership and both dispatch directions in one filter transaction per family.
++    // Once used, ANY restore failure requires complete replay, never a partial chain reset.
++    int ReplayPolicy(const std::set<int>& users,
++                     const std::map<int, std::vector<int>>& members,
++                     const std::set<int>& enabled);
++    int SetChildChain(int chain, bool enabled);
++    int GetChildChainEnabled(int chain, bool* enabled);
++private:
++    struct State { std::set<int> members; };
++    struct Dispatch { std::set<int> users; std::set<int> enabled; };
++    void InvalidateAfterFailure(int chain); // mutex_ held
++    Restore restore_;
++    const OwnerAttribution attribution_;
++    std::mutex mutex_;
++    std::map<int, State> states_;
++    bool ownsDispatch_ = false;
++    std::optional<Dispatch> dispatch_;
++};
++}
+diff --git a/server/trona/tag-auth/LegacyNativeTagAdapters.cpp b/server/trona/tag-auth/LegacyNativeTagAdapters.cpp
+new file mode 100644
+index 0000000..c7efdd0
+--- /dev/null
++++ b/server/trona/tag-auth/LegacyNativeTagAdapters.cpp
+@@ -0,0 +1,25 @@
++// SPDX-License-Identifier: Apache-2.0
++#include "LegacyNativeTagAdapters.h"
++#include "LegacyTagPermissionOracle.h"
++#include "LegacySocketTagger.h"
++
++namespace trona::network {
++namespace {
++class Oracle final : public LegacyTagPermissionQuery {
++    int check(AuthenticatedTagPeer peer) noexcept override {
++        return QueryUpdateDeviceStatsPermission(peer.pid, peer.uid);
++    }
++};
++class Action final : public LegacySocketTagger {
++    int tag(int fd, uint32_t value, uint32_t uid) noexcept override {
++        return TagLegacySocket(fd, value, uid);
++    }
++};
++}  // namespace
++
++std::shared_ptr<LegacyTagDispatcher> CreateLegacyNativeTagDispatcher(int* error) noexcept {
++    auto dispatcher = LegacyTagDispatcher::create(
++            std::make_shared<Oracle>(), std::make_shared<Action>(), error);
++    return std::shared_ptr<LegacyTagDispatcher>(std::move(dispatcher));
++}
++}  // namespace trona::network
+diff --git a/server/trona/tag-auth/LegacyNativeTagAdapters.h b/server/trona/tag-auth/LegacyNativeTagAdapters.h
+new file mode 100644
+index 0000000..de69069
+--- /dev/null
++++ b/server/trona/tag-auth/LegacyNativeTagAdapters.h
+@@ -0,0 +1,8 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++#include "LegacyTagDispatcher.h"
++
++namespace trona::network {
++// Staged explicit startup factory only. No caller or selector enables it.
++std::shared_ptr<LegacyTagDispatcher> CreateLegacyNativeTagDispatcher(int* error) noexcept;
++}  // namespace trona::network
+diff --git a/server/trona/tag-auth/LegacySocketTagger.cpp b/server/trona/tag-auth/LegacySocketTagger.cpp
+new file mode 100644
+index 0000000..f930323
+--- /dev/null
++++ b/server/trona/tag-auth/LegacySocketTagger.cpp
+@@ -0,0 +1,46 @@
++// SPDX-License-Identifier: Apache-2.0
++#include "LegacySocketTagger.h"
++#include "client/LegacyQtaguidClient.h"
++
++#include <cerrno>
++#include <climits>
++#include <netinet/in.h>
++#include <sys/socket.h>
++
++namespace trona::network {
++namespace {
++int ValidateLegacySocket(int fd, bool checkTagProtocol) {
++    if (fd < 0) return -EBADF;
++    int family = 0;
++    socklen_t length = sizeof(family);
++    if (getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &family, &length) != 0) return -errno;
++    if (length != sizeof(family)) return -EIO;
++    if (family != AF_INET && family != AF_INET6) return -EAFNOSUPPORT;
++    if (!checkTagProtocol) return 0;
++    int protocol = 0;
++    length = sizeof(protocol);
++    if (getsockopt(fd, SOL_SOCKET, SO_PROTOCOL, &protocol, &length) != 0) return -errno;
++    if (length != sizeof(protocol)) return -EIO;
++    // Preserve the modern backend's restriction for kernels older than 5.10.
++    if (protocol != IPPROTO_TCP && protocol != IPPROTO_UDP) return -EPROTONOSUPPORT;
++    return 0;
++}
++}  // namespace
++
++int TagLegacySocket(int socketFd, uint32_t tag, uint32_t resolvedChargeUid) {
++    if (socketFd < 0) return -EBADF;
++    if (resolvedChargeUid > INT32_MAX) return -EINVAL;
++    // CLAT attribution belongs exclusively to its fixed-purpose coordinator.
++    if (resolvedChargeUid == 1029) return -EPERM;
++    const int checked = ValidateLegacySocket(socketFd, true);
++    if (checked != 0) return checked;
++    return tagSocketFromClient(socketFd, tag, resolvedChargeUid);
++}
++
++int UntagLegacySocket(int socketFd) {
++    // Untag remains available for cleanup independently of tag admission.
++    const int checked = ValidateLegacySocket(socketFd, false);
++    if (checked != 0) return checked;
++    return untagSocketFromClient(socketFd);
++}
++}  // namespace trona::network
+diff --git a/server/trona/tag-auth/LegacySocketTagger.h b/server/trona/tag-auth/LegacySocketTagger.h
+new file mode 100644
+index 0000000..6f0da3f
+--- /dev/null
++++ b/server/trona/tag-auth/LegacySocketTagger.h
+@@ -0,0 +1,15 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++
++#include <cstdint>
++
++namespace trona::network {
++// Privileged action, not authorization: call only after the dispatcher verifies
++// the captured peer and resolves/authorizes the full charge UID. Caller must
++// retain exclusive ownership of the received FD through completion. No UID
++// sentinel is accepted here. The existing writer retains a process tracker.
++// Never enable until native startup has verified the genuine legacy backend.
++// Returns zero or negative errno; no FD is closed here.
++int TagLegacySocket(int socketFd, uint32_t tag, uint32_t resolvedChargeUid);
++int UntagLegacySocket(int socketFd);
++}  // namespace trona::network
+diff --git a/server/trona/tag-auth/LegacyTagDispatcher.cpp b/server/trona/tag-auth/LegacyTagDispatcher.cpp
+new file mode 100644
+index 0000000..143597e
+--- /dev/null
++++ b/server/trona/tag-auth/LegacyTagDispatcher.cpp
+@@ -0,0 +1,251 @@
++// SPDX-License-Identifier: Apache-2.0
++#include "LegacyTagDispatcher.h"
++
++#include <algorithm>
++#include <atomic>
++#include <cerrno>
++#include <condition_variable>
++#include <deque>
++#include <fcntl.h>
++#include <cstdlib>
++#include <pthread.h>
++#include <unistd.h>
++#include <vector>
++
++namespace trona::network {
++namespace {
++using Clock = LegacyTagRequest::Clock;
++
++void complete(std::unique_ptr<LegacyTagRequest> request, int error) noexcept {
++    auto completion = std::move(request->completion);
++    request.reset();  // Close received socket before replying/releasing the client.
++    if (completion) completion->complete(error);
++}
++
++bool exempt(uint32_t peerUid, uint32_t chargeUid) {
++    const uint32_t appId = peerUid % 100000;
++    return peerUid == chargeUid || appId == 0 || appId == 1000 || appId == 1051;
++}
++}  // namespace
++
++LegacyTagRequest::LegacyTagRequest(AuthenticatedTagPeer identity, int fd, uint32_t value,
++        uint32_t chargeUid, Clock::time_point expiry,
++        std::unique_ptr<LegacyTagCompletion> reply)
++    : peer(identity), socketFd(fd), tag(value), requestedChargeUid(chargeUid),
++      deadline(expiry), completion(std::move(reply)) {}
++
++LegacyTagRequest::~LegacyTagRequest() {
++    if (socketFd >= 0) close(socketFd);
++}
++
++struct LegacyTagDispatcher::Core {
++    struct Pending {
++        const AuthenticatedTagPeer peer;
++        const uint32_t chargeUid;
++        const Clock::time_point deadline;
++        std::mutex mutex;
++        std::atomic<bool> done{false};
++        std::unique_ptr<LegacyTagRequest> request;
++
++        Pending(std::unique_ptr<LegacyTagRequest> value, uint32_t charge,
++                Clock::time_point expiry)
++            : peer(value->peer), chargeUid(charge), deadline(expiry), request(std::move(value)) {}
++
++        void cancel(int error) noexcept {
++            std::unique_ptr<LegacyTagRequest> owned;
++            {
++                std::lock_guard<std::mutex> lock(mutex);
++                if (!request) return;
++                owned = std::move(request);
++                done.store(true);
++            }
++            complete(std::move(owned), error);
++        }
++
++        void resolve(int authorization, const std::shared_ptr<LegacySocketTagger>& tagger,
++                     const std::atomic<bool>& stopping) noexcept {
++            std::unique_ptr<LegacyTagRequest> owned;
++            int error;
++            bool commitTag = false;
++            {
++                std::lock_guard<std::mutex> lock(mutex);
++                if (!request) return;  // Deadline/shutdown permanently removed its tag target.
++                if (stopping.load()) error = -ECANCELED;
++                else if (Clock::now() >= deadline) error = -ETIMEDOUT;
++                else if (authorization != 0) error = -EPERM;
++                else if (!tagger) error = -ENOSYS;
++                else { error = 0; commitTag = true; }
++                owned = std::move(request);
++                done.store(true);
++            }
++            // Moving ownership out above is the authorization commit boundary.
++            // A later timeout cannot tag or cancel it; an already committed local
++            // syscall has no proven hard latency bound. Do not hold the pending
++            // lock through that syscall or delay other requests' timeout cleanup.
++            if (commitTag) error = tagger->tag(owned->socketFd, owned->tag, chargeUid);
++            complete(std::move(owned), error);
++        }
++    };
++
++    const std::shared_ptr<LegacyTagPermissionQuery> query;
++    const std::shared_ptr<LegacySocketTagger> tagger;
++    std::atomic<bool> stopping{false};
++    std::mutex mutex;
++    std::condition_variable workChanged, deadlinesChanged;
++    std::deque<std::shared_ptr<Pending>> queue;
++    std::vector<std::shared_ptr<Pending>> admitted;
++
++    Core(std::shared_ptr<LegacyTagPermissionQuery> oracle,
++         std::shared_ptr<LegacySocketTagger> action)
++        : query(std::move(oracle)), tagger(std::move(action)) {}
++
++    void worker() noexcept {
++        for (;;) {
++            std::shared_ptr<Pending> pending;
++            {
++                std::unique_lock<std::mutex> lock(mutex);
++                workChanged.wait(lock, [&] { return stopping.load() || !queue.empty(); });
++                if (stopping.load()) return;
++                pending = queue.front(); queue.pop_front();
++            }
++            if (!pending->done.load() && Clock::now() >= pending->deadline) {
++                pending->cancel(-ETIMEDOUT);
++            } else if (!pending->done.load()) {
++                int authorization = -EPERM;
++                if (query) authorization = query->check(pending->peer);
++                pending->resolve(authorization, tagger, stopping);
++            }
++            {
++                std::lock_guard<std::mutex> lock(mutex);
++                admitted.erase(std::remove(admitted.begin(), admitted.end(), pending), admitted.end());
++            }
++            deadlinesChanged.notify_one();
++        }
++    }
++
++    void expire() noexcept {
++        std::unique_lock<std::mutex> lock(mutex);
++        while (!stopping.load()) {
++            auto next = Clock::time_point::max();
++            for (const auto& pending : admitted) {
++                if (!pending->done.load()) next = std::min(next, pending->deadline);
++            }
++            if (next == Clock::time_point::max()) {
++                deadlinesChanged.wait(lock);
++            } else if (Clock::now() < next) {
++                deadlinesChanged.wait_until(lock, next);
++            } else {
++                std::vector<std::shared_ptr<Pending>> expired;
++                for (const auto& pending : admitted) {
++                    if (!pending->done.load() && pending->deadline <= Clock::now()) {
++                        expired.push_back(pending);
++                    }
++                }
++                lock.unlock();
++                for (const auto& pending : expired) pending->cancel(-ETIMEDOUT);
++                lock.lock();
++            }
++        }
++    }
++
++    void stop() noexcept {
++        std::vector<std::shared_ptr<Pending>> pending;
++        {
++            std::lock_guard<std::mutex> lock(mutex);
++            stopping.store(true);
++            pending = admitted;
++        }
++        workChanged.notify_all(); deadlinesChanged.notify_all();
++        for (const auto& request : pending) request->cancel(-ECANCELED);
++    }
++
++    struct ThreadStart { std::shared_ptr<Core> core; bool deadline; };
++    static void* runThread(void* argument) noexcept {
++        std::unique_ptr<ThreadStart> start(static_cast<ThreadStart*>(argument));
++        auto core = start->core;
++        const bool deadline = start->deadline;
++        start.reset();
++        if (deadline) core->expire(); else core->worker();
++        return nullptr;
++    }
++};
++
++std::mutex LegacyTagDispatcher::instanceMutex_;
++std::weak_ptr<LegacyTagDispatcher::Core> LegacyTagDispatcher::liveCore_;
++
++std::unique_ptr<LegacyTagDispatcher> LegacyTagDispatcher::create(
++        std::shared_ptr<LegacyTagPermissionQuery> query,
++        std::shared_ptr<LegacySocketTagger> tagger, int* error) noexcept {
++    if (error) *error = 0;
++    std::lock_guard<std::mutex> lock(instanceMutex_);
++    if (!liveCore_.expired()) {
++        if (error) *error = -EBUSY;
++        return nullptr;
++    }
++    auto core = std::make_shared<Core>(std::move(query), std::move(tagger));
++    liveCore_ = core;
++    for (size_t i = 0; i <= kWorkerCount; ++i) {
++        auto start = std::make_unique<Core::ThreadStart>(Core::ThreadStart{core, i == kWorkerCount});
++        pthread_t thread;
++        const int status = pthread_create(&thread, nullptr, Core::runThread, start.get());
++        if (status != 0) {
++            core->stop();
++            if (error) *error = -status;
++            return nullptr;
++        }
++        start.release();
++        // A just-created joinable thread must be detachable. Fail startup if its
++        // lifecycle cannot be accounted for, rather than start another pool.
++        if (pthread_detach(thread) != 0) std::abort();
++    }
++    return std::unique_ptr<LegacyTagDispatcher>(new LegacyTagDispatcher(std::move(core)));
++}
++
++LegacyTagDispatcher::~LegacyTagDispatcher() {
++    core_->stop();
++    // Binder cannot cancel a hung call. Fixed workers retain Core/query lifetime,
++    // and an uncommitted request has no FD/client lease after cancellation.
++    // Already committed local actions retain theirs until they return.
++    // liveCore_ prevents replacement pools until
++    // all old workers exit, keeping even repeated teardown resource-bounded.
++}
++
++LegacyTagDispatcher::Submission LegacyTagDispatcher::submit(
++        std::unique_ptr<LegacyTagRequest> request) {
++    if (!request) return Submission::Completed;
++    if (request->peer.pid <= 0 || request->peer.uid == UINT32_MAX || !request->completion) {
++        complete(std::move(request), -EINVAL); return Submission::Completed;
++    }
++    if (request->socketFd < 0 || fcntl(request->socketFd, F_GETFD) == -1) {
++        complete(std::move(request), -EBADF); return Submission::Completed;
++    }
++    const uint32_t charge = request->requestedChargeUid == UINT32_MAX
++            ? request->peer.uid : request->requestedChargeUid;
++    if (charge == 1029) {
++        complete(std::move(request), -EPERM); return Submission::Completed;
++    }
++    const auto deadline = std::min(request->deadline, Clock::now() + kMaxDelay);
++    if (Clock::now() >= deadline) {
++        complete(std::move(request), -ETIMEDOUT); return Submission::Completed;
++    }
++    if (exempt(request->peer.uid, charge)) {
++        int error = -ENOSYS;
++        if (core_->tagger) error = core_->tagger->tag(request->socketFd, request->tag, charge);
++        complete(std::move(request), error); return Submission::Completed;
++    }
++    auto pending = std::make_shared<Core::Pending>(std::move(request), charge, deadline);
++    bool admitted = false;
++    {
++        std::lock_guard<std::mutex> lock(core_->mutex);
++        if (core_->admitted.size() < kMaxAdmitted) {
++            core_->admitted.push_back(pending);
++            core_->queue.push_back(pending);
++            admitted = true;
++        }
++    }
++    if (!admitted) { pending->cancel(-EAGAIN); return Submission::Completed; }
++    core_->workChanged.notify_one(); core_->deadlinesChanged.notify_one();
++    return Submission::Deferred;
++}
++
++}  // namespace trona::network
+diff --git a/server/trona/tag-auth/LegacyTagDispatcher.h b/server/trona/tag-auth/LegacyTagDispatcher.h
+new file mode 100644
+index 0000000..c5c794e
+--- /dev/null
++++ b/server/trona/tag-auth/LegacyTagDispatcher.h
+@@ -0,0 +1,87 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++
++#include <chrono>
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include <mutex>
++#include <utility>
++
++namespace trona::network {
++
++// The caller captures these from SocketClient's SO_PEERCRED-backed accessors.
++// This value object preserves identity; constructing it does not authenticate it.
++struct AuthenticatedTagPeer { int32_t pid; uint32_t uid; };
++
++class LegacyTagPermissionQuery {
++public:
++    virtual ~LegacyTagPermissionQuery() = default;
++    // Uncached authoritative query. Zero grants; every other result denies.
++    // May block indefinitely. Only the fixed query workers may invoke it.
++    virtual int check(AuthenticatedTagPeer peer) noexcept = 0;
++};
++
++class LegacySocketTagger {
++public:
++    virtual ~LegacySocketTagger() = default;
++    // Local tag operation, without Binder calls or controller locks. Zero or a
++    // negative errno. Its kernel syscall has no promised hard latency bound.
++    virtual int tag(int socketFd, uint32_t tag, uint32_t chargeUid) noexcept = 0;
++};
++
++class LegacyTagCompletion {
++public:
++    virtual ~LegacyTagCompletion() = default;
++    // Must be nonblocking/noexcept; destructor releases the retained client lease.
++    virtual void complete(int error) noexcept = 0;
++};
++
++struct LegacyTagRequest {
++    using Clock = std::chrono::steady_clock;
++    const AuthenticatedTagPeer peer;
++    const int socketFd;
++    const uint32_t tag;
++    const uint32_t requestedChargeUid;
++    const Clock::time_point deadline;
++    std::unique_ptr<LegacyTagCompletion> completion;
++
++    LegacyTagRequest(AuthenticatedTagPeer, int receivedFd, uint32_t tag,
++                     uint32_t requestedChargeUid, Clock::time_point deadline,
++                     std::unique_ptr<LegacyTagCompletion>);
++    ~LegacyTagRequest();
++    LegacyTagRequest(const LegacyTagRequest&) = delete;
++    LegacyTagRequest& operator=(const LegacyTagRequest&) = delete;
++};
++
++class LegacyTagDispatcher {
++public:
++    static constexpr size_t kWorkerCount = 2;
++    static constexpr size_t kMaxAdmitted = 4;
++    static constexpr std::chrono::milliseconds kMaxDelay{250};
++    enum class Submission { Completed, Deferred };
++
++    // No exceptions: creation returns null with negative errno on busy/thread failure.
++    // As with ordinary Android C++ allocations, allocation failure is process-fatal.
++    static std::unique_ptr<LegacyTagDispatcher> create(
++            std::shared_ptr<LegacyTagPermissionQuery>, std::shared_ptr<LegacySocketTagger>,
++            int* error) noexcept;
++    ~LegacyTagDispatcher();
++    LegacyTagDispatcher(const LegacyTagDispatcher&) = delete;
++    LegacyTagDispatcher& operator=(const LegacyTagDispatcher&) = delete;
++
++    // Always consumes FD and completion/client ownership, including rejection.
++    // Deadline bounds pending authorization and its commit, not an already
++    // committed local syscall or its reply latency.
++    Submission submit(std::unique_ptr<LegacyTagRequest>);
++
++private:
++    struct Core;
++    explicit LegacyTagDispatcher(std::shared_ptr<Core> core) : core_(std::move(core)) {}
++    std::shared_ptr<Core> core_;
++    // One process-wide fixed budget. A hung old query prevents replacement pools.
++    static std::mutex instanceMutex_;
++    static std::weak_ptr<Core> liveCore_;
++};
++
++}  // namespace trona::network
+diff --git a/server/trona/tag-auth/LegacyTagPermissionOracle.cpp b/server/trona/tag-auth/LegacyTagPermissionOracle.cpp
+new file mode 100644
+index 0000000..9fdb05e
+--- /dev/null
++++ b/server/trona/tag-auth/LegacyTagPermissionOracle.cpp
+@@ -0,0 +1,54 @@
++// SPDX-License-Identifier: Apache-2.0
++#include "LegacyTagPermissionOracle.h"
++
++#include <binder/IBinder.h>
++#include <binder/IPermissionController.h>
++#include <binder/IServiceManager.h>
++#include <binder/Parcel.h>
++#include <binder/Status.h>
++#include <utils/String16.h>
++
++#include <cerrno>
++#include <cstdint>
++#include <limits>
++
++namespace trona::network {
++
++int QueryUpdateDeviceStatsPermission(pid_t authenticatedPid, uid_t authenticatedUid) {
++    if (authenticatedPid <= 0 || authenticatedUid >
++            static_cast<uid_t>(std::numeric_limits<int32_t>::max())) {
++        return -EINVAL;
++    }
++
++    const auto manager = android::defaultServiceManager();
++    if (manager == nullptr) return -EAGAIN;
++    const auto controller = manager->checkService(android::String16("permission"));
++    if (controller == nullptr) return -EAGAIN;
++
++    android::Parcel request;
++    android::Parcel reply;
++    if (request.writeInterfaceToken(android::IPermissionController::descriptor)
++                    != android::OK ||
++        request.writeString16(android::String16("android.permission.UPDATE_DEVICE_STATS"))
++                    != android::OK ||
++        request.writeInt32(static_cast<int32_t>(authenticatedPid)) != android::OK ||
++        request.writeInt32(static_cast<int32_t>(authenticatedUid)) != android::OK) {
++        return -EREMOTEIO;
++    }
++    if (controller->transact(android::IPermissionController::CHECK_PERMISSION_TRANSACTION,
++                             request, &reply) != android::OK) {
++        return -EREMOTEIO;
++    }
++
++    if (reply.objectsCount() != 0) return -EBADMSG;
++    android::binder::Status status;
++    if (status.readFromParcel(reply) != android::OK || !status.isOk()) return -EREMOTEIO;
++    if (reply.dataAvail() != sizeof(int32_t)) return -EBADMSG;
++    int32_t granted = 0;
++    if (reply.readInt32(&granted) != android::OK || (granted != 0 && granted != 1)) {
++        return -EBADMSG;
++    }
++    return granted == 1 ? 0 : -EACCES;
++}
++
++}  // namespace trona::network
+diff --git a/server/trona/tag-auth/LegacyTagPermissionOracle.h b/server/trona/tag-auth/LegacyTagPermissionOracle.h
+new file mode 100644
+index 0000000..b01ad14
+--- /dev/null
++++ b/server/trona/tag-auth/LegacyTagPermissionOracle.h
+@@ -0,0 +1,15 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++
++#include <sys/types.h>
++
++namespace trona::network {
++
++// Fresh UPDATE_DEVICE_STATS query for an already authenticated peer identity.
++// Returns 0 only for a successful canonical grant reply; denial and discovery,
++// transport or parsing errors return negative errno. Nothing is cached.
++// Service discovery and Binder transact are synchronous and can hang. Call only
++// from a bounded worker whose caller can fail closed; never a netd listener loop.
++int QueryUpdateDeviceStatsPermission(pid_t authenticatedPid, uid_t authenticatedUid);
++
++}  // namespace trona::network
+diff --git a/server/trona/tag-auth/SocketClientTagCompletion.cpp b/server/trona/tag-auth/SocketClientTagCompletion.cpp
+new file mode 100644
+index 0000000..9c36412
+--- /dev/null
++++ b/server/trona/tag-auth/SocketClientTagCompletion.cpp
+@@ -0,0 +1,25 @@
++// SPDX-License-Identifier: Apache-2.0
++#include "SocketClientTagCompletion.h"
++
++#include <cstdlib>
++#include <sys/socket.h>
++#include <sysutils/SocketClient.h>
++
++namespace trona::network {
++
++SocketClientTagCompletion::SocketClientTagCompletion(SocketClient* client) : client_(client) {
++    if (!client_) std::abort();  // Internal programming error; never select an unauthenticated lease.
++    client_->incRef();
++}
++
++SocketClientTagCompletion::~SocketClientTagCompletion() { client_->decRef(); }
++
++void SocketClientTagCompletion::complete(int error) noexcept {
++    static_assert(sizeof(error) == 4, "FwmarkClient expects a four-byte native error value");
++    // A single nonblocking reply attempt, never SocketClient's blocking writev.
++    // Short/failed sends are followed by final ref release/connection close.
++    // The handoff contract makes this the only writer for this one-shot client.
++    (void)send(client_->getSocket(), &error, sizeof(error), MSG_DONTWAIT | MSG_NOSIGNAL);
++}
++
++}  // namespace trona::network
+diff --git a/server/trona/tag-auth/SocketClientTagCompletion.h b/server/trona/tag-auth/SocketClientTagCompletion.h
+new file mode 100644
+index 0000000..cbfd2f9
+--- /dev/null
++++ b/server/trona/tag-auth/SocketClientTagCompletion.h
+@@ -0,0 +1,25 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++
++#include "LegacyTagDispatcher.h"
++
++class SocketClient;
++
++namespace trona::network {
++
++// Acquire while FwmarkServer's onDataAvailable still owns the client's reference.
++// The selecting caller must suppress its ordinary FD close/reply and return false
++// exactly as before: this lease then owns the single reply and final client ref.
++class SocketClientTagCompletion final : public LegacyTagCompletion {
++public:
++    explicit SocketClientTagCompletion(SocketClient* client);
++    ~SocketClientTagCompletion() override;
++    SocketClientTagCompletion(const SocketClientTagCompletion&) = delete;
++    SocketClientTagCompletion& operator=(const SocketClientTagCompletion&) = delete;
++    void complete(int error) noexcept override;
++
++private:
++    SocketClient* const client_;
++};
++
++}  // namespace trona::network
+diff --git a/server/trona/tag-auth/client/LegacyQtaguidClient.cpp b/server/trona/tag-auth/client/LegacyQtaguidClient.cpp
+new file mode 100644
+index 0000000..a1e9de8
+--- /dev/null
++++ b/server/trona/tag-auth/client/LegacyQtaguidClient.cpp
+@@ -0,0 +1,95 @@
++// SPDX-License-Identifier: Apache-2.0
++#include "LegacyQtaguidClient.h"
++
++#include <cerrno>
++#include <cinttypes>
++#include <cstdio>
++#include <fcntl.h>
++#include <pthread.h>
++#include <unistd.h>
++
++#ifndef TRONA_QTAGUID_TRACK_PATH
++#define TRONA_QTAGUID_TRACK_PATH "/dev/xt_qtaguid"
++#endif
++#ifndef TRONA_QTAGUID_CTRL_PATH
++#define TRONA_QTAGUID_CTRL_PATH "/proc/net/xt_qtaguid/ctrl"
++#endif
++
++namespace trona::network {
++namespace {
++pthread_mutex_t trackerMutex = PTHREAD_MUTEX_INITIALIZER;
++pthread_once_t forkRegistration = PTHREAD_ONCE_INIT;
++int trackerFd = -1;
++int forkRegistrationError = 0;
++
++void beforeFork() { pthread_mutex_lock(&trackerMutex); }
++void afterParentFork() { pthread_mutex_unlock(&trackerMutex); }
++void afterChildFork() {
++    // A child must not use the parent's tracking file description. Its first tag
++    // opens a tracker owned by the child's process.
++    if (trackerFd >= 0) close(trackerFd);
++    trackerFd = -1;
++    pthread_mutex_unlock(&trackerMutex);
++}
++void registerForkHandlers() {
++    forkRegistrationError = pthread_atfork(beforeFork, afterParentFork, afterChildFork);
++}
++
++int ensureTracked() {
++    int result = pthread_once(&forkRegistration, registerForkHandlers);
++    if (result != 0) return -result;
++    if (forkRegistrationError != 0) return -forkRegistrationError;
++    result = pthread_mutex_lock(&trackerMutex);
++    if (result != 0) return -result;
++    if (trackerFd < 0) {
++        do {
++            trackerFd = open(TRONA_QTAGUID_TRACK_PATH, O_RDONLY | O_CLOEXEC);
++        } while (trackerFd < 0 && errno == EINTR);
++        if (trackerFd < 0) result = -errno;
++    }
++    const int unlock = pthread_mutex_unlock(&trackerMutex);
++    if (result == 0 && unlock != 0) result = -unlock;
++    return result;
++}
++
++int writeControl(const char* command, size_t size) {
++    int fd;
++    do {
++        fd = open(TRONA_QTAGUID_CTRL_PATH, O_WRONLY | O_CLOEXEC);
++    } while (fd < 0 && errno == EINTR);
++    if (fd < 0) return -errno;
++    ssize_t written;
++    do {
++        written = write(fd, command, size);
++    } while (written < 0 && errno == EINTR);
++    // A proc command is one transaction. A partial write cannot be retried as a suffix.
++    const int error = written < 0 ? errno : (static_cast<size_t>(written) == size ? 0 : EIO);
++    close(fd);
++    return -error;
++}
++}
++
++int tagSocketFromClient(int socketFd, uint32_t tag, uid_t uid) {
++    if (socketFd < 0) return -EBADF;
++    const int tracked = ensureTracked();
++    if (tracked != 0) return tracked;
++    char command[96];
++    const auto rawTag = static_cast<uint64_t>(tag) << 32;
++    // -1 means the caller's UID. Omitting the UID lets the kernel use
++    // current_fsuid; formatting -1 as an unsigned UID would fail permission checks.
++    const int size = uid == static_cast<uid_t>(-1)
++            ? snprintf(command, sizeof(command), "t %d %" PRIu64, socketFd, rawTag)
++            : snprintf(command, sizeof(command), "t %d %" PRIu64 " %u", socketFd,
++                       rawTag, uid);
++    if (size < 0 || static_cast<size_t>(size) >= sizeof(command)) return -EOVERFLOW;
++    return writeControl(command, static_cast<size_t>(size));
++}
++
++int untagSocketFromClient(int socketFd) {
++    if (socketFd < 0) return -EBADF;
++    char command[32];
++    const int size = snprintf(command, sizeof(command), "u %d", socketFd);
++    if (size < 0 || static_cast<size_t>(size) >= sizeof(command)) return -EOVERFLOW;
++    return writeControl(command, static_cast<size_t>(size));
++}
++}
+diff --git a/server/trona/tag-auth/client/LegacyQtaguidClient.h b/server/trona/tag-auth/client/LegacyQtaguidClient.h
+new file mode 100644
+index 0000000..ae0ab27
+--- /dev/null
++++ b/server/trona/tag-auth/client/LegacyQtaguidClient.h
+@@ -0,0 +1,11 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++
++#include <cstdint>
++#include <sys/types.h>
++
++namespace trona::network {
++// Return 0 on a complete kernel control write, otherwise a negative errno.
++int tagSocketFromClient(int socketFd, uint32_t tag, uid_t uid);
++int untagSocketFromClient(int socketFd);
++}

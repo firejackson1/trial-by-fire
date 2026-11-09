@@ -1,0 +1,156 @@
+diff --git a/libc/Android.bp b/libc/Android.bp
+index 73cda9a..59a884a 100644
+--- a/libc/Android.bp
++++ b/libc/Android.bp
+@@ -477,9 +477,22 @@ cc_library_static {
+ //
+ // These files are built with the openbsd-compat.h header file
+ // automatically included.
++soong_config_module_type {
++    name: "trona_entropy_cc_defaults",
++    module_type: "cc_defaults",
++    config_namespace: "trona_compat",
++    bool_variables: ["kernel_entropy_only"],
++    properties: ["cflags"],
++}
++trona_entropy_cc_defaults {
++    name: "trona_entropy_defaults",
++    soong_config_variables: {
++        kernel_entropy_only: { cflags: ["-DTRONA_KERNEL_ENTROPY_ONLY"] },
++    },
++}
+ cc_library_static {
+     name: "libc_openbsd",
+-    defaults: ["libc_defaults"],
++    defaults: ["libc_defaults", "trona_entropy_defaults"],
+     srcs: [
+         "upstream-openbsd/lib/libc/crypt/arc4random.c",
+         "upstream-openbsd/lib/libc/crypt/arc4random_uniform.c",
+diff --git a/libc/bionic/fdsan.cpp b/libc/bionic/fdsan.cpp
+index 382696c..b28cbfd 100644
+--- a/libc/bionic/fdsan.cpp
++++ b/libc/bionic/fdsan.cpp
+@@ -36,6 +36,8 @@
+ #include <string.h>
+ #include <sys/cdefs.h>
+ #include <sys/mman.h>
++#include <link.h>
++#include <sys/auxv.h>
+ #include <sys/syscall.h>
+ #include <unistd.h>
+ 
+@@ -45,6 +47,7 @@
+ #include <sys/system_properties.h>
+ 
+ #include "private/bionic_fdtrack.h"
++#include "private/bionic_asm_note.h"
+ #include "private/bionic_globals.h"
+ #include "private/bionic_inline_raise.h"
+ #include "pthread_internal.h"
+@@ -107,9 +110,48 @@ FdEntry* FdTableImpl<inline_fds>::at(size_t idx) {
+   return &local_overflow->entries[offset];
+ }
+ 
++// trona: executables built for API 30 or older (this tablet's retained Android 11 vendor)
++// predate fatal-by-default fdsan; stock Android 11 libc defaulted to WARN_ONCE. Everything
++// built for a newer API, and any explicit debug.fdsan setting, is unchanged.
++static android_fdsan_error_level __fdsan_default_level_for_executable() {
++  const auto* phdr = reinterpret_cast<const ElfW(Phdr)*>(getauxval(AT_PHDR));
++  size_t phnum = getauxval(AT_PHNUM);
++  if (phdr == nullptr || phnum == 0) return ANDROID_FDSAN_ERROR_LEVEL_FATAL;
++  ElfW(Addr) load_bias = 0;
++  bool have_bias = false;
++  for (size_t i = 0; i < phnum; ++i) {
++    if (phdr[i].p_type == PT_PHDR) {
++      load_bias = reinterpret_cast<ElfW(Addr)>(phdr) - phdr[i].p_vaddr;
++      have_bias = true;
++      break;
++    }
++  }
++  if (!have_bias) return ANDROID_FDSAN_ERROR_LEVEL_FATAL;
++  for (size_t i = 0; i < phnum; ++i) {
++    if (phdr[i].p_type != PT_NOTE) continue;
++    ElfW(Addr) p = load_bias + phdr[i].p_vaddr;
++    ElfW(Addr) end = p + phdr[i].p_memsz;
++    while (p + sizeof(ElfW(Nhdr)) <= end) {
++      const auto* nh = reinterpret_cast<const ElfW(Nhdr)*>(p);
++      ElfW(Addr) name = p + sizeof(ElfW(Nhdr));
++      ElfW(Addr) desc = name + __builtin_align_up(nh->n_namesz, 4);
++      ElfW(Addr) next = desc + __builtin_align_up(nh->n_descsz, 4);
++      if (next > end || next <= p) break;
++      if (nh->n_type == NT_ANDROID_TYPE_IDENT && nh->n_namesz == 8 &&
++          memcmp(reinterpret_cast<const char*>(name), "Android", 8) == 0 && nh->n_descsz >= 4) {
++        int32_t api;
++        memcpy(&api, reinterpret_cast<const void*>(desc), sizeof(api));
++        return (api > 0 && api <= 30) ? ANDROID_FDSAN_ERROR_LEVEL_WARN_ONCE
++                                      : ANDROID_FDSAN_ERROR_LEVEL_FATAL;
++      }
++      p = next;
++    }
++  }
++  return ANDROID_FDSAN_ERROR_LEVEL_FATAL;
++}
++
+ void __libc_init_fdsan() {
+-  constexpr auto default_level = ANDROID_FDSAN_ERROR_LEVEL_FATAL;
+-  android_fdsan_set_error_level_from_property(default_level);
++  android_fdsan_set_error_level_from_property(__fdsan_default_level_for_executable());
+ }
+ 
+ static FdTable& GetFdTable() {
+diff --git a/libc/upstream-openbsd/lib/libc/crypt/arc4random.c b/libc/upstream-openbsd/lib/libc/crypt/arc4random.c
+index 0737cf3..68ace6d 100644
+--- a/libc/upstream-openbsd/lib/libc/crypt/arc4random.c
++++ b/libc/upstream-openbsd/lib/libc/crypt/arc4random.c
+@@ -23,6 +23,45 @@
+  * ChaCha based random number generator for OpenBSD.
+  */
+ 
++#if defined(TRONA_KERNEL_ENTROPY_ONLY)
++// Dedicated development product: fresh kernel CSPRNG bytes for every request.
++// No userspace PRNG state survives fork. Flags0 waits for initialized entropy.
++#include <errno.h>
++#include <pthread.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <sys/random.h>
++#include <async_safe/log.h>
++static pthread_mutex_t g_arc4random_mutex = PTHREAD_MUTEX_INITIALIZER;
++void arc4random_mutex_lock(void) { pthread_mutex_lock(&g_arc4random_mutex); }
++void arc4random_mutex_unlock(void) { pthread_mutex_unlock(&g_arc4random_mutex); }
++static void trona_kernel_entropy(void* output, size_t remaining) {
++  const int saved_errno = errno;
++  unsigned char* cursor = output;
++  while (remaining != 0) {
++    const size_t request = remaining > 256 ? 256 : remaining;
++    const ssize_t result = getrandom(cursor, request, 0);
++    if (result == -1 && errno == EINTR) continue;
++    if (result <= 0 || (size_t)result > request) {
++      if (result >= 0) errno = EIO;
++      async_safe_fatal("kernel entropy read failed: %m");
++    }
++    cursor += result;
++    remaining -= result;
++  }
++  errno = saved_errno;
++}
++uint32_t arc4random(void) {
++  uint32_t result;
++  trona_kernel_entropy(&result, sizeof(result));
++  return result;
++}
++DEF_WEAK(arc4random);
++void arc4random_buf(void* buffer, size_t size) {
++  trona_kernel_entropy(buffer, size);
++}
++DEF_WEAK(arc4random_buf);
++#else
+ #include <fcntl.h>
+ #include <limits.h>
+ #include <signal.h>
+@@ -202,3 +241,5 @@ arc4random_buf(void *buf, size_t n)
+ 	_ARC4_UNLOCK();
+ }
+ DEF_WEAK(arc4random_buf);
++
++#endif // TRONA_KERNEL_ENTROPY_ONLY

@@ -1,0 +1,13 @@
+diff --git a/build/apex/Android.bp b/build/apex/Android.bp
+index f24eb80..0340c86 100644
+--- a/build/apex/Android.bp
++++ b/build/apex/Android.bp
+@@ -201,7 +201,7 @@ apex_defaults {
+         default: unset,
+     }),
+ 
+-    payload_fs_type: "erofs",
++    payload_fs_type: "ext4",
+     erofs: {
+         pcluster_size: 32768,
+     },

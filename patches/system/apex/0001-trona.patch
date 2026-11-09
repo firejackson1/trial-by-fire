@@ -1,0 +1,14 @@
+diff --git a/apexd/apexd.rc b/apexd/apexd.rc
+index 2dcc1f5..421fb4d 100644
+--- a/apexd/apexd.rc
++++ b/apexd/apexd.rc
+@@ -15,7 +15,8 @@ service apexd-bootstrap /system/bin/apexd --bootstrap
+     group system
+     oneshot
+     disabled
+-    reboot_on_failure reboot,bootloader,bootstrap-apexd-failed
++    timeout_period 180
++    reboot_on_failure reboot,recovery
+     # CAP_SYS_ADMIN is required to access device-mapper and to use mount syscall
+     # apexd-bootstrap doesn't manage apexdata snapshot & restore, hence no need for other capabilities.
+     capabilities SYS_ADMIN MKNOD

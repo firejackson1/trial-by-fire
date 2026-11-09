@@ -1,0 +1,18 @@
+diff --git a/lmkd.cpp b/lmkd.cpp
+index 4bac215..64720f0 100644
+--- a/lmkd.cpp
++++ b/lmkd.cpp
+@@ -3534,6 +3534,13 @@ static bool init_memevent_listener_monitoring() {
+ 
+     if (memevent_listener) return true;
+ 
++    // trona's 4.4 kernel path has no BPF loader, so this property is never set.
++    // Waiting here would block lmkd's main loop forever and stall system_server.
++    if (!property_get_bool("bpf.progs_loaded", false)) {
++        ALOGI("BPF programs not loaded; memevent listener disabled");
++        return false;
++    }
++
+     // Make sure bpf programs are loaded, else we'll wait until they are loaded
+     android::bpf::waitForProgsLoaded();
+     memevent_listener = std::make_unique<android::bpf::memevents::MemEventListener>(

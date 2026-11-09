@@ -1,0 +1,225 @@
+diff --git a/media/java/android/media/AudioHalVersionInfo.java b/media/java/android/media/AudioHalVersionInfo.java
+index 3e456a65c..5ba7fdbec 100644
+--- a/media/java/android/media/AudioHalVersionInfo.java
++++ b/media/java/android/media/AudioHalVersionInfo.java
+@@ -84,7 +84,7 @@ public final class AudioHalVersionInfo implements Parcelable, Comparable<AudioHa
+      * there is a change to supported versions.
+      */
+     public static final @NonNull List<AudioHalVersionInfo> VERSIONS =
+-            List.of(AIDL_1_0, HIDL_7_1, HIDL_7_0, HIDL_6_0);
++            List.of(AIDL_1_0, HIDL_7_1, HIDL_7_0, HIDL_6_0, HIDL_4_0);
+ 
+     private static final String TAG = "AudioHalVersionInfo";
+     private AudioHalVersion mHalVersion = new AudioHalVersion();
+diff --git a/packages/SystemUI/src/com/android/systemui/shade/QuickSettingsControllerImpl.java b/packages/SystemUI/src/com/android/systemui/shade/QuickSettingsControllerImpl.java
+index aca00f244..0700eb5aa 100644
+--- a/packages/SystemUI/src/com/android/systemui/shade/QuickSettingsControllerImpl.java
++++ b/packages/SystemUI/src/com/android/systemui/shade/QuickSettingsControllerImpl.java
+@@ -1581,7 +1581,12 @@ public class QuickSettingsControllerImpl implements QuickSettingsController, Dum
+             return top + mNotificationStackScrollLayoutController.getHeight()
+                     + mSplitShadeNotificationsScrimMarginBottom;
+         } else {
+-            return mPanelView.getBottom();
++            // trona (owner request): end the portrait notification panel just below the last
++            // notification, like split shade does, instead of stretching to the screen bottom.
++            int contentBottom = (int) mNotificationStackScrollLayoutController
++                    .getBottomMostNotificationBottom()
++                    + mSplitShadeNotificationsScrimMarginBottom;
++            return Math.min(Math.max(contentBottom, top), mPanelView.getBottom());
+         }
+     }
+ 
+diff --git a/services/core/java/com/android/server/net/NetworkManagementService.java b/services/core/java/com/android/server/net/NetworkManagementService.java
+index 74f0d9cf3..db4acd7a8 100644
+--- a/services/core/java/com/android/server/net/NetworkManagementService.java
++++ b/services/core/java/com/android/server/net/NetworkManagementService.java
+@@ -229,6 +229,12 @@ public class NetworkManagementService extends INetworkManagementService.Stub {
+     @GuardedBy("mRulesLock")
+     final SparseBooleanArray mFirewallChainStates = new SparseBooleanArray();
+ 
++    // A failed RPC can commit before throwing. Last ACK alone cannot suppress retries.
++    @GuardedBy("mQuotaLock")
++    private final SparseBooleanArray mFirewallChainStateUncertain = new SparseBooleanArray();
++    @GuardedBy("mQuotaLock")
++    private final SparseBooleanArray mFirewallUidRulesUncertain = new SparseBooleanArray();
++
+     // TODO: b/336693007 - Remove once NPMS has completely migrated to metered firewall chains.
+     @GuardedBy("mQuotaLock")
+     private volatile boolean mDataSaverMode;
+@@ -1093,26 +1099,27 @@ public class NetworkManagementService extends INetworkManagementService.Stub {
+     public void setFirewallChainEnabled(int chain, boolean enable) {
+         enforceSystemUid();
+         synchronized (mQuotaLock) {
+-            synchronized (mRulesLock) {
+-                if (getFirewallChainState(chain) == enable) {
+-                    // All is the same, nothing to do.  This relies on the fact that netd has child
+-                    // chains default detached.
+-                    return;
+-                }
+-                setFirewallChainState(chain, enable);
+-            }
+-
+             if (!isValidFirewallChainForSetEnabled(chain)) {
+                 throw new IllegalArgumentException("Invalid chain for setFirewallChainEnabled: "
+                         + NetworkPolicyLogger.getFirewallChainName(chain));
+             }
++            synchronized (mRulesLock) {
++                if (!mFirewallChainStateUncertain.get(chain)
++                        && getFirewallChainState(chain) == enable) {
++                    // Only acknowledged state can suppress a repeated request.
++                    return;
++                }
++            }
+ 
+             final ConnectivityManager cm = mContext.getSystemService(ConnectivityManager.class);
+             try {
+                 cm.setFirewallChainEnabled(chain, enable);
+             } catch (RuntimeException e) {
++                mFirewallChainStateUncertain.put(chain, true);
+                 throw new IllegalStateException(e);
+             }
++            setFirewallChainState(chain, enable);
++            mFirewallChainStateUncertain.put(chain, false);
+         }
+     }
+ 
+@@ -1148,7 +1155,21 @@ public class NetworkManagementService extends INetworkManagementService.Stub {
+     @Override
+     public void setFirewallUidRules(int chain, int[] uids, int[] rules) {
+         enforceSystemUid();
++        if (uids.length != rules.length) {
++            throw new IllegalArgumentException("UID and rule array lengths differ");
++        }
+         synchronized (mQuotaLock) {
++            synchronized (mRulesLock) {
++                // Validate before the RPC; preserve the current cache until acknowledgement.
++                getUidFirewallRulesLR(chain);
++            }
++            final ConnectivityManager cm = mContext.getSystemService(ConnectivityManager.class);
++            try {
++                cm.replaceFirewallChain(chain, uids);
++            } catch (RuntimeException e) {
++                mFirewallUidRulesUncertain.put(chain, true);
++                throw new IllegalStateException("Error flushing firewall chain " + chain, e);
++            }
+             synchronized (mRulesLock) {
+                 SparseIntArray uidFirewallRules = getUidFirewallRulesLR(chain);
+                 SparseIntArray newRules = new SparseIntArray();
+@@ -1173,12 +1194,7 @@ public class NetworkManagementService extends INetworkManagementService.Stub {
+                     updateFirewallUidRuleLocked(chain, uid, FIREWALL_RULE_DEFAULT);
+                 }
+             }
+-            final ConnectivityManager cm = mContext.getSystemService(ConnectivityManager.class);
+-            try {
+-                cm.replaceFirewallChain(chain, uids);
+-            } catch (RuntimeException e) {
+-                Slog.w(TAG, "Error flushing firewall chain " + chain, e);
+-            }
++            mFirewallUidRulesUncertain.put(chain, false);
+         }
+     }
+ 
+@@ -1191,14 +1207,25 @@ public class NetworkManagementService extends INetworkManagementService.Stub {
+     }
+ 
+     private void setFirewallUidRuleLocked(int chain, int uid, int rule) {
+-        if (updateFirewallUidRuleLocked(chain, uid, rule)) {
++        final int oldRule;
++        synchronized (mRulesLock) {
++            oldRule = getUidFirewallRulesLR(chain).get(uid, FIREWALL_RULE_DEFAULT);
++        }
++        final boolean uncertain = mFirewallUidRulesUncertain.get(chain);
++        if (!uncertain && oldRule == rule) return;
++        if (uncertain || !getFirewallRuleName(chain, oldRule).equals(getFirewallRuleName(chain, rule))) {
+             final ConnectivityManager cm = mContext.getSystemService(ConnectivityManager.class);
+             try {
+                 cm.setUidFirewallRule(chain, uid, rule);
+             } catch (RuntimeException e) {
++                mFirewallUidRulesUncertain.put(chain, true);
+                 throw new IllegalStateException(e);
+             }
+         }
++        // A single UID ACK cannot resolve a previous ambiguous whole-chain update.
++        // Keep forwarding calls until a complete replacement succeeds.
++        // Equivalent explicit/default rules still update the cache without an RPC.
++        updateFirewallUidRuleLocked(chain, uid, rule);
+     }
+ 
+     // TODO: now that netd supports batching, NMS should not keep these data structures anymore...
+diff --git a/services/core/java/com/android/server/net/NetworkPolicyManagerService.java b/services/core/java/com/android/server/net/NetworkPolicyManagerService.java
+index 797013a7f..7f3bb0442 100644
+--- a/services/core/java/com/android/server/net/NetworkPolicyManagerService.java
++++ b/services/core/java/com/android/server/net/NetworkPolicyManagerService.java
+@@ -677,6 +677,9 @@ public class NetworkPolicyManagerService extends INetworkPolicyManager.Stub {
+     @GuardedBy("mUidRulesFirstLock")
+     final SparseBooleanArray mFirewallChainStates = new SparseBooleanArray();
+ 
++    @GuardedBy("mUidRulesFirstLock")
++    private final SparseBooleanArray mFirewallChainStateUncertain = new SparseBooleanArray();
++
+     // "Power save mode" is the concept used in the DeviceIdleController that includes various
+     // features including Doze and Battery Saver. It include Battery Saver, but "power save mode"
+     // and "battery saver" are not equivalent.
+@@ -6911,18 +6914,22 @@ public class NetworkPolicyManagerService extends INetworkPolicyManager.Stub {
+      */
+     @GuardedBy("mUidRulesFirstLock")
+     private void enableFirewallChainUL(int chain, boolean enable) {
+-        if (mFirewallChainStates.indexOfKey(chain) >= 0 &&
++        if (!mFirewallChainStateUncertain.get(chain)
++                && mFirewallChainStates.indexOfKey(chain) >= 0 &&
+                 mFirewallChainStates.get(chain) == enable) {
+             // All is the same, nothing to do.
+             return;
+         }
+-        mFirewallChainStates.put(chain, enable);
+         try {
+             mNetworkManager.setFirewallChainEnabled(chain, enable);
++            mFirewallChainStates.put(chain, enable);
++            mFirewallChainStateUncertain.put(chain, false);
+             mLogger.firewallChainEnabled(chain, enable);
+         } catch (IllegalStateException e) {
++            mFirewallChainStateUncertain.put(chain, true);
+             Log.wtf(TAG, "problem enable firewall chain", e);
+         } catch (RemoteException e) {
++            mFirewallChainStateUncertain.put(chain, true);
+             // ignored; service lives in system_server
+         }
+     }
+diff --git a/services/core/java/com/android/server/power/hint/HintManagerService.java b/services/core/java/com/android/server/power/hint/HintManagerService.java
+index 5d9e51289..c063c9ccc 100644
+--- a/services/core/java/com/android/server/power/hint/HintManagerService.java
++++ b/services/core/java/com/android/server/power/hint/HintManagerService.java
+@@ -324,12 +324,12 @@ public final class HintManagerService extends SystemService {
+         mPowerHalVersion = 0;
+         mVendorApiLevel = Integer.parseInt(SystemProperties.get(PROPERTY_VENDOR_API_LEVEL, ""));
+         mUsesFmq = false;
+-        if (mPowerHal != null) {
+-            try {
+-                mSupportInfo = getSupportInfo();
+-            } catch (RemoteException e) {
+-                throw new IllegalStateException("Could not contact PowerHAL!", e);
+-            }
++        // trona: the vendor declares no AIDL IPower, so mPowerHal can be null here.
++        // getSupportInfo() then returns its all-unsupported defaults.
++        try {
++            mSupportInfo = getSupportInfo();
++        } catch (RemoteException e) {
++            throw new IllegalStateException("Could not contact PowerHAL!", e);
+         }
+         if (mSupportInfo.headroom.isCpuSupported) {
+             mCpuHeadroomCache = new HeadroomCache<>(2, mSupportInfo.headroom.cpuMinIntervalMillis);
+@@ -363,9 +363,11 @@ public final class HintManagerService extends SystemService {
+ 
+     SupportInfo getSupportInfo() throws RemoteException {
+         try {
+-            mPowerHalVersion = mPowerHal.getInterfaceVersion();
+-            if (mPowerHalVersion >= 6) {
+-                return mPowerHal.getSupportInfo();
++            if (mPowerHal != null) {
++                mPowerHalVersion = mPowerHal.getInterfaceVersion();
++                if (mPowerHalVersion >= 6) {
++                    return mPowerHal.getSupportInfo();
++                }
+             }
+         } catch (RemoteException e) {
+             throw new IllegalStateException("Could not contact PowerHAL!", e);

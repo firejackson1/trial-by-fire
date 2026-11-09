@@ -1,0 +1,4 @@
+# Built images and proprietary vendor-derived files never go in this repository.
+*.img
+device/amazon/trona-compat/camera/*.bin
+out/

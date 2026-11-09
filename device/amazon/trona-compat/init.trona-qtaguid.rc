@@ -1,0 +1,8 @@
+# Retained accounting: trust root and the system UID, preserve per-app stat filters.
+on init && property:ro.trona.network_backend=legacy
+    chown system root /proc/net/xt_qtaguid/ctrl
+    chmod 0600 /proc/net/xt_qtaguid/ctrl
+    chown root root /proc/net/xt_qtaguid/stats
+    chmod 0444 /proc/net/xt_qtaguid/stats
+    chown system root /dev/xt_qtaguid
+    chmod 0600 /dev/xt_qtaguid

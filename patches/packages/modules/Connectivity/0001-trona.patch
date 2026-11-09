@@ -1,0 +1,2922 @@
+diff --git a/bpf/loader/netbpfload.rc b/bpf/loader/netbpfload.rc
+index a937d7e..965869f 100644
+--- a/bpf/loader/netbpfload.rc
++++ b/bpf/loader/netbpfload.rc
+@@ -35,7 +35,9 @@
+ # failures (before memory is fragmented, and cpu is busy running tons of other
+ # stuff) and we absolutely want to be before netd and the system boot slot is
+ # considered to have booted successfully.
+-on load-bpf-programs
++# The selector is an immutable exact enum. Unset retains the ordinary modern path.
++# Keep these actions at this event: enqueueing a sub-event would follow zygote-start.
++on load-bpf-programs && property:ro.trona.network_backend=
+     # Temporarily relax access to kallsyms so that bpfloader can resolve kernel symbols
+     # at load time.
+     #
+@@ -58,6 +60,37 @@ on load-bpf-programs
+     exec_start netd1shot
+     start netd
+ 
++on load-bpf-programs && property:ro.trona.network_backend=modern
++    # Temporarily relax access to kallsyms so that bpfloader can resolve kernel symbols
++    # at load time.
++    #
++    # NOTE: Still requires CAP_SYSLOG and sepolicy allow rules to read /proc/kallsyms
++    write /proc/sys/kernel/kptr_restrict 1
++
++    # 'exec_start' is synchronous, a successful bpfloader invocation will
++    # result in 'bpf.progs_loaded' property being set to '1'.
++    exec_start bpfloader
++
++    # Wait for bpf programs to be loaded before proceeding.
++    # (this will hang if bpfloader fails)
++    wait_for_prop bpf.progs_loaded 1
++
++    # Restore kallsyms protection after bpf programs have been loaded.
++    # This has to happen after bpfloader has already terminated.
++    write /proc/sys/kernel/kptr_restrict 2
++
++    # At this point 'bpf.progs_loaded' is guaranteed to be '1'
++    exec_start netd1shot
++    start netd
++
++on load-bpf-programs && property:ro.trona.network_backend=legacy
++    # This path never invokes bpfloader or publishes a BPF-success property.
++    setprop sys.trona.netd_ready 0
++    write /proc/sys/kernel/kptr_restrict 2
++    start netd
++    # Bounded native ready verification; reboot_on_failure belongs to netd1shot.
++    exec_start netd1shot
++
+ # Note: This will actually execute /apex/com.android.tethering/bin/netbpfload
+ # by virtue of 'service bpfloader' being overridden by the apex shipped .rc
+ # Warning: the below settings are irrelevant unless the apex is missing.
+diff --git a/service-t/Sources.bp b/service-t/Sources.bp
+index fbe02a5..e64c344 100644
+--- a/service-t/Sources.bp
++++ b/service-t/Sources.bp
+@@ -19,6 +19,9 @@ filegroup {
+     name: "lib_networkStatsFactory_native",
+     srcs: [
+         "jni/com_android_server_net_NetworkStatsFactory.cpp",
++        "jni/trona/LegacyQtaguidStats.cpp",
++        "jni/trona/LegacyTrafficStats.cpp",
++        "jni/trona/qtaguid/qtaguid.c",
+     ],
+     visibility: [
+         "//packages/modules/Connectivity:__subpackages__",
+@@ -29,6 +32,9 @@ filegroup {
+     name: "services.connectivity-netstats-jni-sources",
+     srcs: [
+         "jni/com_android_server_net_NetworkStatsFactory.cpp",
++        "jni/trona/LegacyQtaguidStats.cpp",
++        "jni/trona/LegacyTrafficStats.cpp",
++        "jni/trona/qtaguid/qtaguid.c",
+         "jni/com_android_server_net_NetworkStatsService.cpp",
+     ],
+     visibility: [
+diff --git a/service-t/jni/com_android_server_net_NetworkStatsFactory.cpp b/service-t/jni/com_android_server_net_NetworkStatsFactory.cpp
+index 5edd0f6..7a74d6b 100644
+--- a/service-t/jni/com_android_server_net_NetworkStatsFactory.cpp
++++ b/service-t/jni/com_android_server_net_NetworkStatsFactory.cpp
+@@ -21,6 +21,9 @@
+ #include <sys/stat.h>
+ #include <sys/types.h>
+ #include <vector>
++#include <cstring>
++#include <limits>
++#include <sstream>
+ 
+ #include <jni.h>
+ 
+@@ -34,6 +37,8 @@
+ #include <utils/misc.h>
+ 
+ #include "android-base/unique_fd.h"
++#include "android-base/file.h"
++#include "trona/LegacyQtaguidStats.h"
+ #include "bpf/BpfUtils.h"
+ #include "netdbpf/BpfNetworkStats.h"
+ 
+@@ -89,7 +94,7 @@ static jlongArray get_long_array(JNIEnv* env, jobject obj, jfieldID field, int s
+ }
+ 
+ static int statsLinesToNetworkStats(JNIEnv* env, jclass clazz, jobject stats,
+-                            std::vector<stats_line>& lines) {
++                            std::vector<stats_line>& lines, bool resetDefaults = false) {
+     int size = lines.size();
+ 
+     bool grow = size > env->GetIntField(stats, gNetworkStatsClassInfo.capacity);
+@@ -150,6 +155,15 @@ static int statsLinesToNetworkStats(JNIEnv* env, jclass clazz, jobject stats,
+         set[i] = lines[i].set;
+         tag[i] = lines[i].tag;
+         // Metered, roaming and defaultNetwork are populated in Java-land.
++        // The legacy reader also permits reusing an output object; clear values
++        // that the kernel snapshot does not contain. Existing BPF callers retain
++        // their current behavior through the default argument.
++        if (resetDefaults) {
++            metered[i] = 0;
++            roaming[i] = 0;
++            defaultNetwork[i] = 0;
++            operations[i] = 0;
++        }
+         rxBytes[i] = lines[i].rxBytes;
+         rxPackets[i] = lines[i].rxPackets;
+         txBytes[i] = lines[i].txBytes;
+@@ -192,9 +206,52 @@ static int readNetworkStatsDev(JNIEnv* env, jclass clazz, jobject stats) {
+     return statsLinesToNetworkStats(env, clazz, stats, lines);
+ }
+ 
++// Internal path parameter permits fixture tests; Java receives no arbitrary-path API.
++static int readLegacyNetworkStatsFromPath(JNIEnv* env, jclass clazz, jobject stats,
++                                         const char* path, bool summary) {
++    if (!stats || !path) return -EINVAL;
++    std::string contents;
++    if (!android::base::ReadFileToString(path, &contents)) {
++        return errno == 0 ? -EIO : -errno;
++    }
++    std::istringstream input(contents);
++    std::vector<trona::network::QtaguidStatsEntry> parsed;
++    const int result = summary
++            ? trona::network::ReadQtaguidIfaceStats(input,
++                    trona::network::QtaguidIfaceFormat::Formatted, &parsed)
++            : trona::network::ReadQtaguidStats(input, &parsed);
++    if (result != 0) return result;
++    if (parsed.size() > static_cast<size_t>(std::numeric_limits<jint>::max())) return -EOVERFLOW;
++
++    // Allocate final size once: stats_line declares a custom copy assignment,
++    // so do not rely on its deprecated implicit copy constructor during growth.
++    std::vector<stats_line> lines(parsed.size());
++    for (size_t i = 0; i < parsed.size(); ++i) {
++        const auto& entry = parsed[i];
++        auto& line = lines[i];
++        // The parser has checked the destination's 32-byte interface bound.
++        std::memcpy(line.iface, entry.iface.c_str(), entry.iface.size() + 1);
++        line.uid = static_cast<uint32_t>(entry.uid);
++        line.set = static_cast<uint32_t>(entry.set);
++        line.tag = static_cast<uint32_t>(entry.tag);
++        line.rxBytes = entry.rxBytes;
++        line.rxPackets = entry.rxPackets;
++        line.txBytes = entry.txBytes;
++        line.txPackets = entry.txPackets;
++    }
++    return statsLinesToNetworkStats(env, clazz, stats, lines, true);
++}
++
++static int readNetworkStatsLegacy(JNIEnv* env, jclass clazz, jobject stats, jboolean summary) {
++    return readLegacyNetworkStatsFromPath(env, clazz, stats,
++            summary ? "/proc/net/xt_qtaguid/iface_stat_fmt" : "/proc/net/xt_qtaguid/stats",
++            summary);
++}
++
+ static const JNINativeMethod gMethods[] = {
+     MAKE_JNI_NATIVE_METHOD("nativeReadNetworkStatsDetail", "(Landroid/net/NetworkStats;)I", readNetworkStatsDetail),
+     MAKE_JNI_NATIVE_METHOD("nativeReadNetworkStatsDev", "(Landroid/net/NetworkStats;)I", readNetworkStatsDev),
++    MAKE_JNI_NATIVE_METHOD("nativeReadNetworkStatsLegacy", "(Landroid/net/NetworkStats;Z)I", readNetworkStatsLegacy),
+ };
+ 
+ int register_android_server_net_NetworkStatsFactory(JNIEnv* env) {
+diff --git a/service-t/jni/com_android_server_net_NetworkStatsService.cpp b/service-t/jni/com_android_server_net_NetworkStatsService.cpp
+index a724f3f..7bf3e4c 100644
+--- a/service-t/jni/com_android_server_net_NetworkStatsService.cpp
++++ b/service-t/jni/com_android_server_net_NetworkStatsService.cpp
+@@ -16,6 +16,10 @@
+ 
+ #define LOG_TAG "NetworkStatsNative"
+ 
++#include <android-base/file.h>
++#include <sstream>
++#include "trona/LegacyTrafficStats.h"
++#include "trona/qtaguid/include/qtaguid/qtaguid.h"
+ #include <cutils/qtaguid.h>
+ #include <dirent.h>
+ #include <errno.h>
+@@ -69,6 +73,58 @@ static jobject statsValueToEntry(JNIEnv* env, StatsValue* stats) {
+     return result;
+ }
+ 
++// The path parameter is an internal file-IO boundary for host tests. Java gets
++// only fixed proc paths, never a caller-supplied path or backend selector.
++static jobject readLegacyTrafficStatsFromPath(JNIEnv* env, const char* path,
++                                              const char* iface, jint uid, bool uidQuery) {
++    if (!path || (uidQuery && uid < 0)) return nullptr;
++    std::string contents;
++    if (!android::base::ReadFileToString(path, &contents)) return nullptr;
++    std::istringstream input(contents);
++    trona::network::QtaguidTrafficStats counters{};
++    const int result = uidQuery
++            ? trona::network::ReadQtaguidUidTrafficStats(input, uid, &counters)
++            : trona::network::ReadQtaguidIfaceTrafficStats(input, iface, &counters);
++    if (result != 0) return nullptr;
++    StatsValue stats{};
++    stats.rxBytes = counters.rxBytes;
++    stats.rxPackets = counters.rxPackets;
++    stats.txBytes = counters.txBytes;
++    stats.txPackets = counters.txPackets;
++    return statsValueToEntry(env, &stats);
++}
++
++static jobject nativeGetLegacyTotalStat(JNIEnv* env, jclass) {
++    return readLegacyTrafficStatsFromPath(env, "/proc/net/xt_qtaguid/iface_stat_fmt",
++                                         nullptr, 0, false);
++}
++
++static jobject nativeGetLegacyIfaceStat(JNIEnv* env, jclass, jstring iface) {
++    if (!iface) return nullptr;
++    ScopedUtfChars iface8(env, iface);
++    if (!iface8.c_str()) return nullptr;
++    return readLegacyTrafficStatsFromPath(env, "/proc/net/xt_qtaguid/iface_stat_fmt",
++                                         iface8.c_str(), 0, false);
++}
++
++static jobject nativeGetLegacyUidStat(JNIEnv* env, jclass, jint uid) {
++    return readLegacyTrafficStatsFromPath(env, "/proc/net/xt_qtaguid/stats", nullptr, uid, true);
++}
++
++static jint nativeSetLegacyCounterSet(JNIEnv*, jclass, jint uid, jint counterSet) {
++    // Android counter sets are DEFAULT=0 and FOREGROUND=1. Never reinterpret a
++    // negative Java UID as an unsigned kernel UID or a wildcard.
++    if (uid < 0 || (counterSet != 0 && counterSet != 1)) return -EINVAL;
++    return legacy_setCounterSet(counterSet, static_cast<uid_t>(uid));
++}
++
++static jint nativeDeleteLegacyUidStats(JNIEnv*, jclass, jint uid) {
++    if (uid < 0) return -EINVAL;
++    // Tag zero deletes all accounting/tag state for exactly this UID.
++    // Return the captured negative error directly, never errno after cleanup.
++    return legacy_deleteTagData(0, static_cast<uid_t>(uid));
++}
++
+ static jobject nativeGetTotalStat(JNIEnv* env, jclass clazz) {
+     StatsValue stats = {};
+     if (bpfGetIfaceStats(nullptr, &stats)) return nullptr;
+@@ -95,6 +151,11 @@ static void nativeInitNetworkTracing(JNIEnv* env, jclass clazz) {
+ }
+ 
+ static const JNINativeMethod gMethods[] = {
++    MAKE_JNI_NATIVE_METHOD_AUTOSIG("nativeSetLegacyCounterSet", nativeSetLegacyCounterSet),
++    MAKE_JNI_NATIVE_METHOD_AUTOSIG("nativeDeleteLegacyUidStats", nativeDeleteLegacyUidStats),
++    MAKE_JNI_NATIVE_METHOD("nativeGetLegacyTotalStat", "()Landroid/net/NetworkStats$Entry;", nativeGetLegacyTotalStat),
++    MAKE_JNI_NATIVE_METHOD("nativeGetLegacyIfaceStat", "(Ljava/lang/String;)Landroid/net/NetworkStats$Entry;", nativeGetLegacyIfaceStat),
++    MAKE_JNI_NATIVE_METHOD("nativeGetLegacyUidStat", "(I)Landroid/net/NetworkStats$Entry;", nativeGetLegacyUidStat),
+     MAKE_JNI_NATIVE_METHOD_AUTOSIG("nativeRegisterIface", nativeRegisterIface),
+     MAKE_JNI_NATIVE_METHOD("nativeGetTotalStat", "()Landroid/net/NetworkStats$Entry;", nativeGetTotalStat),
+     MAKE_JNI_NATIVE_METHOD("nativeGetIfaceStat", "(Ljava/lang/String;)Landroid/net/NetworkStats$Entry;", nativeGetIfaceStat),
+diff --git a/service-t/jni/trona/LegacyQtaguidStats.cpp b/service-t/jni/trona/LegacyQtaguidStats.cpp
+new file mode 100644
+index 0000000..5922959
+--- /dev/null
++++ b/service-t/jni/trona/LegacyQtaguidStats.cpp
+@@ -0,0 +1,138 @@
++// SPDX-License-Identifier: Apache-2.0
++#include "LegacyQtaguidStats.h"
++#include <array>
++#include <cerrno>
++#include <charconv>
++#include <cstring>
++#include <locale>
++#include <sstream>
++#include <string_view>
++#include <utility>
++
++namespace trona::network {
++namespace {
++template <typename T> bool decimal(std::string_view text, T* output) {
++    if (text.empty() || text[0] == '-' || text[0] == '+') return false;
++    const auto end = text.data() + text.size();
++    const auto result = std::from_chars(text.data(), end, *output, 10);
++    return result.ec == std::errc{} && result.ptr == end;
++}
++
++template <size_t N> bool fields(const std::string& line, std::array<std::string, N>* values) {
++    std::istringstream stream(line);
++    stream.imbue(std::locale::classic());
++    for (auto& value : *values) if (!(stream >> value)) return false;
++    // Kernel TCP/UDP/other breakdown columns are not part of the returned totals.
++    return true;
++}
++
++bool tag(std::string_view text, int32_t* output, uint64_t* rawOutput) {
++    if (text.size() < 3 || text[0] != '0' || (text[1] != 'x' && text[1] != 'X')) return false;
++    text.remove_prefix(2);
++    uint64_t combined;
++    const auto end = text.data() + text.size();
++    const auto result = std::from_chars(text.data(), end, combined, 16);
++    if (result.ec != std::errc{} || result.ptr != end) return false;
++    // Match NetworkStatsFactory.kernelToTag: upper 32 bits, retaining signed
++    // Android tag bit patterns (for example 0xffffff01 -> -255).
++    const uint32_t upper = combined >> 32;
++    static_assert(sizeof(upper) == sizeof(*output));
++    std::memcpy(output, &upper, sizeof(upper));
++    *rawOutput = combined;
++    return true;
++}
++}  // namespace
++
++int ReadQtaguidStats(std::istream& input, std::vector<QtaguidStatsEntry>* output) {
++    if (!output || input.exceptions() != std::ios::goodbit) return -EINVAL;
++    std::string line;
++    if (!std::getline(input, line)) return input.bad() ? -EIO : -EPROTO;
++    std::array<std::string, 9> values;
++    const std::array<std::string, 9> expected = {"idx", "iface", "acct_tag_hex", "uid_tag_int",
++            "cnt_set", "rx_bytes", "rx_packets", "tx_bytes", "tx_packets"};
++    if (!fields(line, &values) || values != expected) return -EPROTO;
++    uint64_t previous = 1;
++    std::vector<QtaguidStatsEntry> parsed;
++    while (std::getline(input, line)) {
++        if (!fields(line, &values)) return -EPROTO;
++        uint64_t index;
++        QtaguidStatsEntry entry{};
++        if (!decimal(values[0], &index) || previous == UINT64_MAX || index != previous + 1
++                || values[1].empty() || values[1].size() >= 32
++                || values[1].find('\0') != std::string::npos
++                || !tag(values[2], &entry.tag, &entry.rawTag) || !decimal(values[3], &entry.uid)
++                || !decimal(values[4], &entry.set) || !decimal(values[5], &entry.rxBytes)
++                || !decimal(values[6], &entry.rxPackets) || !decimal(values[7], &entry.txBytes)
++                || !decimal(values[8], &entry.txPackets)) return -EPROTO;
++        previous = index;
++        entry.iface = values[1];
++        parsed.push_back(std::move(entry));
++    }
++    if (input.bad() || (!input.eof() && input.fail())) return -EIO;
++    output->swap(parsed);
++    return 0;
++}
++}  // namespace trona::network
++
++namespace trona::network {
++namespace {
++bool ifaceCounters(std::istringstream& row, std::array<int64_t, 4>* counters) {
++    std::string field;
++    for (auto& counter : *counters) {
++        if (!(row >> field) || !decimal(field, &counter)) return false;
++    }
++    return true;
++}
++}  // namespace
++
++int ReadQtaguidIfaceStats(std::istream& input, QtaguidIfaceFormat format,
++                         std::vector<QtaguidStatsEntry>* output) {
++    if (!output || input.exceptions() != std::ios::goodbit
++            || (format != QtaguidIfaceFormat::All && format != QtaguidIfaceFormat::Formatted)) {
++        return -EINVAL;
++    }
++    std::string line;
++    if (format == QtaguidIfaceFormat::Formatted) {
++        if (!std::getline(input, line)) return input.bad() ? -EIO : -EPROTO;
++        std::array<std::string, 5> names;
++        const std::array<std::string, 5> expected = {"ifname", "total_skb_rx_bytes",
++                "total_skb_rx_packets", "total_skb_tx_bytes", "total_skb_tx_packets"};
++        if (!fields(line, &names) || names != expected) return -EPROTO;
++    }
++    std::vector<QtaguidStatsEntry> parsed;
++    while (std::getline(input, line)) {
++        std::istringstream row(line);
++        row.imbue(std::locale::classic());
++        QtaguidStatsEntry entry{};
++        entry.uid = -1;  // NetworkStats.UID_ALL
++        entry.set = -1;  // NetworkStats.SET_ALL
++        if (!(row >> entry.iface) || entry.iface.size() >= 32
++                || entry.iface.find('\0') != std::string::npos) return -EPROTO;
++        int32_t active = 0;
++        if (format == QtaguidIfaceFormat::All) {
++            std::string field;
++            if (!(row >> field) || !decimal(field, &active)) return -EPROTO;
++        }
++        std::array<int64_t, 4> counters;
++        if (!ifaceCounters(row, &counters)) return -EPROTO;
++        if (active != 0) {
++            std::array<int64_t, 4> live;
++            if (!ifaceCounters(row, &live)) return -EPROTO;
++            for (size_t i = 0; i < counters.size(); ++i) {
++                if (live[i] > INT64_MAX - counters[i]) return -EOVERFLOW;
++                counters[i] += live[i];
++            }
++        }
++        // As in the legacy platform reader, ignore extra columns, including
++        // live counters on inactive interfaces. Never add those twice.
++        entry.rxBytes = counters[0];
++        entry.rxPackets = counters[1];
++        entry.txBytes = counters[2];
++        entry.txPackets = counters[3];
++        parsed.push_back(std::move(entry));
++    }
++    if (input.bad() || (!input.eof() && input.fail())) return -EIO;
++    output->swap(parsed);
++    return 0;
++}
++}  // namespace trona::network
+diff --git a/service-t/jni/trona/LegacyQtaguidStats.h b/service-t/jni/trona/LegacyQtaguidStats.h
+new file mode 100644
+index 0000000..1fb8a3a
+--- /dev/null
++++ b/service-t/jni/trona/LegacyQtaguidStats.h
+@@ -0,0 +1,40 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++#include <cstdint>
++#include <istream>
++#include <string>
++#include <vector>
++
++namespace trona::network {
++// Raw cumulative counters. These are NOT the incremental BPF samples consumed by
++// Android 17 NetworkStatsFactory. No reset/delta, VPN, CLAT, or filtering here.
++struct QtaguidStatsEntry {
++    std::string iface;
++    int32_t uid;
++    int32_t set;
++    int32_t tag;
++    int64_t rxBytes;
++    int64_t rxPackets;
++    int64_t txBytes;
++    int64_t txPackets;
++    // Keep the complete proc tag for consumers (TrafficStats) that test raw
++    // tag zero. NetworkStats uses the separate signed upper-32-bit tag above.
++    uint64_t rawTag = 0;
++};
++
++// Parse the standard xt_qtaguid stats text. Publish a complete result only on
++// success. Return negative errno on malformed input/read failure; never replace
++// the caller's previous data with an empty or partial successful snapshot.
++// An empty, valid header-only snapshot is legitimate. Caller owns/opened the stream
++// and must leave its exception mask disabled (Android builds without exceptions).
++int ReadQtaguidStats(std::istream& input, std::vector<QtaguidStatsEntry>* output);
++
++enum class QtaguidIfaceFormat { All, Formatted };
++
++// Interface totals use UID_ALL/SET_ALL (-1) and TAG_NONE (0). All is the
++// headerless iface_stat_all format: saved counters plus live counters only when
++// active. Formatted is iface_stat_fmt (IP-layer totals with a header).
++// Same stream/error/publication contract as ReadQtaguidStats; no file is opened.
++int ReadQtaguidIfaceStats(std::istream& input, QtaguidIfaceFormat format,
++                         std::vector<QtaguidStatsEntry>* output);
++}  // namespace trona::network
+diff --git a/service-t/jni/trona/LegacyTrafficStats.cpp b/service-t/jni/trona/LegacyTrafficStats.cpp
+new file mode 100644
+index 0000000..9b7faee
+--- /dev/null
++++ b/service-t/jni/trona/LegacyTrafficStats.cpp
+@@ -0,0 +1,49 @@
++// SPDX-License-Identifier: Apache-2.0
++#include "LegacyTrafficStats.h"
++#include "LegacyQtaguidStats.h"
++#include <cerrno>
++#include <limits>
++
++namespace trona::network {
++namespace {
++bool addCounters(QtaguidTrafficStats& sum, const QtaguidStatsEntry& row) {
++    constexpr int64_t max = std::numeric_limits<int64_t>::max();
++    if (row.rxBytes > max - sum.rxBytes || row.rxPackets > max - sum.rxPackets
++            || row.txBytes > max - sum.txBytes || row.txPackets > max - sum.txPackets) {
++        return false;
++    }
++    sum.rxBytes += row.rxBytes;
++    sum.rxPackets += row.rxPackets;
++    sum.txBytes += row.txBytes;
++    sum.txPackets += row.txPackets;
++    return true;
++}
++}  // namespace
++
++int ReadQtaguidUidTrafficStats(std::istream& input, int32_t uid, QtaguidTrafficStats* output) {
++    if (!output || uid < 0) return -EINVAL;
++    std::vector<QtaguidStatsEntry> rows;
++    const int result = ReadQtaguidStats(input, &rows);
++    if (result != 0) return result;
++    QtaguidTrafficStats sum{};
++    for (const auto& row : rows) {
++        if (row.uid == uid && row.rawTag == 0 && !addCounters(sum, row)) return -EOVERFLOW;
++    }
++    *output = sum;
++    return 0;
++}
++
++int ReadQtaguidIfaceTrafficStats(std::istream& input, const char* iface,
++                               QtaguidTrafficStats* output) {
++    if (!output) return -EINVAL;
++    std::vector<QtaguidStatsEntry> rows;
++    const int result = ReadQtaguidIfaceStats(input, QtaguidIfaceFormat::Formatted, &rows);
++    if (result != 0) return result;
++    QtaguidTrafficStats sum{};
++    for (const auto& row : rows) {
++        if ((!iface || row.iface == iface) && !addCounters(sum, row)) return -EOVERFLOW;
++    }
++    *output = sum;
++    return 0;
++}
++}  // namespace trona::network
+diff --git a/service-t/jni/trona/LegacyTrafficStats.h b/service-t/jni/trona/LegacyTrafficStats.h
+new file mode 100644
+index 0000000..6d03a2f
+--- /dev/null
++++ b/service-t/jni/trona/LegacyTrafficStats.h
+@@ -0,0 +1,22 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++#include <cstdint>
++#include <istream>
++
++namespace trona::network {
++struct QtaguidTrafficStats {
++    int64_t rxBytes;
++    int64_t rxPackets;
++    int64_t txBytes;
++    int64_t txPackets;
++};
++
++// Raw TrafficStats queries, not VPN/CLAT-adjusted historical usage. UID totals
++// include only full raw tag zero across sets/interfaces; tagged rows overlap totals.
++// Interface queries use iface_stat_fmt (IP-layer totals), with null = all ifaces.
++// Valid no-match/empty snapshots yield zero. Errors preserve *output and return
++// negative errno. Streams must have exceptions disabled. No file IO/selection.
++int ReadQtaguidUidTrafficStats(std::istream& input, int32_t uid, QtaguidTrafficStats* output);
++int ReadQtaguidIfaceTrafficStats(std::istream& input, const char* iface,
++                               QtaguidTrafficStats* output);
++}  // namespace trona::network
+diff --git a/service-t/jni/trona/qtaguid/include/qtaguid/qtaguid.h b/service-t/jni/trona/qtaguid/include/qtaguid/qtaguid.h
+new file mode 100644
+index 0000000..72285e5
+--- /dev/null
++++ b/service-t/jni/trona/qtaguid/include/qtaguid/qtaguid.h
+@@ -0,0 +1,62 @@
++/*
++ * Copyright (C) 2011 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef __LEGACY_QTAGUID_H
++#define __LEGACY_QTAGUID_H
++
++#include <stdint.h>
++#include <sys/types.h>
++#include <unistd.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*
++ * Set tags (and owning UIDs) for network sockets. The socket must be untagged
++ * by calling qtaguid_untagSocket() before closing it, otherwise the qtaguid
++ * module will keep a reference to it even after close.
++ */
++extern int legacy_tagSocket(int sockfd, int tag, uid_t uid);
++
++/*
++ * Untag a network socket before closing.
++ */
++extern int legacy_untagSocket(int sockfd);
++
++/*
++ * For the given uid, switch counter sets.
++ * The kernel only keeps a limited number of sets.
++ * 2 for now.
++ */
++extern int legacy_setCounterSet(int counterSetNum, uid_t uid);
++
++/*
++ * Delete all tag info that relates to the given tag an uid.
++ * If the tag is 0, then ALL info about the uid is freeded.
++ * The delete data also affects active tagged socketd, which are
++ * then untagged.
++ * The calling process can only operate on its own tags.
++ * Unless it is part of the happy AID_NET_BW_ACCT group.
++ * In which case it can clobber everything.
++ */
++extern int legacy_deleteTagData(int tag, uid_t uid);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* __LEGACY_QTAGUID_H */
+diff --git a/service-t/jni/trona/qtaguid/qtaguid.c b/service-t/jni/trona/qtaguid/qtaguid.c
+new file mode 100644
+index 0000000..1394722
+--- /dev/null
++++ b/service-t/jni/trona/qtaguid/qtaguid.c
+@@ -0,0 +1,151 @@
++/*
++** Copyright 2011, The Android Open Source Project
++**
++** Licensed under the Apache License, Version 2.0 (the "License");
++** you may not use this file except in compliance with the License.
++** You may obtain a copy of the License at
++**
++**     http://www.apache.org/licenses/LICENSE-2.0
++**
++** Unless required by applicable law or agreed to in writing, software
++** distributed under the License is distributed on an "AS IS" BASIS,
++** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++** See the License for the specific language governing permissions and
++** limitations under the License.
++*/
++
++// #define LOG_NDEBUG 0
++
++#define LOG_TAG "qtaguid"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <inttypes.h>
++#include <pthread.h>
++#include <stdio.h>
++#include <string.h>
++#include <unistd.h>
++
++#include <log/log.h>
++#include "include/qtaguid/qtaguid.h"
++
++static const char* CTRL_PROCPATH = "/proc/net/xt_qtaguid/ctrl";
++static const int CTRL_MAX_INPUT_LEN = 128;
++
++/*
++ * One per proccess.
++ * Once the device is open, this process will have its socket tags tracked.
++ * And on exit or untimely death, all socket tags will be removed.
++ * A process can only open /dev/xt_qtaguid once.
++ * It should not close it unless it is really done with all the socket tags.
++ * New socket tags require this descriptor: some legacy kernels accept a tag
++ * without it and cannot clean that tag up when the tagging process exits.
++ * Initialization failure is retained for the lifetime of this library instance.
++ */
++static int resTrackFd = -1;
++static int resTrackError;
++pthread_once_t resTrackInitDone = PTHREAD_ONCE_INIT;
++
++/* Only call once per process. */
++void legacy_resTrack(void) {
++    resTrackFd = TEMP_FAILURE_RETRY(open("/dev/xt_qtaguid", O_RDONLY | O_CLOEXEC));
++    resTrackError = resTrackFd < 0 ? errno : 0;
++}
++
++/*
++ * Returns:
++ *   0 on success.
++ *   -errno on failure.
++ */
++static int write_ctrl(const char* cmd) {
++    int fd, savedErrno;
++    ssize_t res;
++    const size_t commandLength = strlen(cmd);
++
++    ALOGV("write_ctrl(%s)", cmd);
++
++    fd = TEMP_FAILURE_RETRY(open(CTRL_PROCPATH, O_WRONLY | O_CLOEXEC));
++    if (fd < 0) {
++        return -errno;
++    }
++
++    res = TEMP_FAILURE_RETRY(write(fd, cmd, commandLength));
++    if (res < 0) {
++        savedErrno = errno;
++    } else {
++        // A proc command is one transaction; never retry a partial suffix.
++        savedErrno = (size_t)res == commandLength ? 0 : EIO;
++    }
++    if (savedErrno != 0) {
++        // ALOGV is enough because all the callers also log failures
++        ALOGV("Failed write_ctrl(%s) res=%zd errno=%d", cmd, res, savedErrno);
++    }
++    close(fd);
++    return -savedErrno;
++}
++
++int legacy_tagSocket(int sockfd, int tag, uid_t uid) {
++    char lineBuf[CTRL_MAX_INPUT_LEN];
++    int res;
++    uint64_t kTag = ((uint64_t)tag << 32);
++
++    pthread_once(&resTrackInitDone, legacy_resTrack);
++    if (resTrackFd < 0) return -resTrackError;
++
++    snprintf(lineBuf, sizeof(lineBuf), "t %d %" PRIu64 " %d", sockfd, kTag, uid);
++
++    ALOGV("Tagging socket %d with tag %" PRIx64 "{%u,0} for uid %d", sockfd, kTag, tag, uid);
++
++    res = write_ctrl(lineBuf);
++    if (res < 0) {
++        ALOGI("Tagging socket %d with tag %" PRIx64 "(%d) for uid %d failed errno=%d", sockfd, kTag,
++              tag, uid, res);
++    }
++
++    return res;
++}
++
++int legacy_untagSocket(int sockfd) {
++    char lineBuf[CTRL_MAX_INPUT_LEN];
++    int res;
++
++    ALOGV("Untagging socket %d", sockfd);
++
++    snprintf(lineBuf, sizeof(lineBuf), "u %d", sockfd);
++    res = write_ctrl(lineBuf);
++    if (res < 0) {
++        ALOGI("Untagging socket %d failed errno=%d", sockfd, res);
++    }
++
++    return res;
++}
++
++int legacy_setCounterSet(int counterSetNum, uid_t uid) {
++    char lineBuf[CTRL_MAX_INPUT_LEN];
++    int res;
++
++    ALOGV("Setting counters to set %d for uid %d", counterSetNum, uid);
++
++    snprintf(lineBuf, sizeof(lineBuf), "s %d %d", counterSetNum, uid);
++    res = write_ctrl(lineBuf);
++    return res;
++}
++
++int legacy_deleteTagData(int tag, uid_t uid) {
++    char lineBuf[CTRL_MAX_INPUT_LEN];
++    int cnt = 0, res = 0;
++    uint64_t kTag = (uint64_t)tag << 32;
++
++    ALOGV("Deleting tag data with tag %" PRIx64 "{%d,0} for uid %d", kTag, tag, uid);
++
++    pthread_once(&resTrackInitDone, legacy_resTrack);
++
++    snprintf(lineBuf, sizeof(lineBuf), "d %" PRIu64 " %d", kTag, uid);
++    res = write_ctrl(lineBuf);
++    if (res < 0) {
++        ALOGI("Deleting tag data with tag %" PRIx64 "/%d for uid %d failed with cnt=%d errno=%d",
++              kTag, tag, uid, cnt, errno);
++    }
++
++    return res;
++}
+diff --git a/service-t/src/com/android/server/NetworkStatsServiceInitializer.java b/service-t/src/com/android/server/NetworkStatsServiceInitializer.java
+index 675e5a1..7855e88 100644
+--- a/service-t/src/com/android/server/NetworkStatsServiceInitializer.java
++++ b/service-t/src/com/android/server/NetworkStatsServiceInitializer.java
+@@ -58,7 +58,7 @@ public final class NetworkStatsServiceInitializer extends SystemService {
+         // on userdebug/eng builds and flag protected in user builds.
+         if (SdkLevel.isAtLeastU() && (mNetworkTracingFlagEnabled || !Build.TYPE.equals("user"))) {
+             Log.i(TAG, "Initializing network tracing hooks");
+-            NetworkStatsService.nativeInitNetworkTracing();
++            if (mStatsService != null) mStatsService.initNetworkTracing();
+         }
+     }
+ 
+diff --git a/service-t/src/com/android/server/NsdService.java b/service-t/src/com/android/server/NsdService.java
+index d94acb8..2336d46 100644
+--- a/service-t/src/com/android/server/NsdService.java
++++ b/service-t/src/com/android/server/NsdService.java
+@@ -142,6 +142,7 @@ import com.android.net.module.util.InetAddressUtils;
+ import com.android.net.module.util.PermissionUtils;
+ import com.android.net.module.util.SdkUtil;
+ import com.android.net.module.util.SharedLog;
++import com.android.server.connectivity.TronaNetworkProfile;
+ import com.android.server.connectivity.mdns.ExecutorProvider;
+ import com.android.server.connectivity.mdns.MdnsAdvertiser;
+ import com.android.server.connectivity.mdns.MdnsAdvertisingOptions;
+@@ -1856,18 +1857,31 @@ public class NsdService extends INsdManager.Stub {
+                         args.serviceInfo, clientInfo, usingLocalNetworkPermission);
+             }
+         };
++        final Runnable unsupportedCb = () -> clientInfo.onResolveServiceFailedImmediately(
++                clientRequestId, NsdManager.FAILURE_INTERNAL_ERROR, !useJavaBackend,
++                false /* usingLocalNetworkPermission */);
+         checkQueryServicePermissions(clientInfo, args.serviceInfo.getServiceName(), serviceType,
+-                disallowedCb, allowedCb);
++                disallowedCb, unsupportedCb, allowedCb);
+     }
+ 
+     private void checkQueryServicePermissions(@NonNull ClientInfo clientInfo,
+             @Nullable String serviceName, @Nullable String serviceType,
+-            @NonNull Runnable disallowedCb, @NonNull Consumer<Boolean> allowedCb) {
++            @NonNull Runnable disallowedCb, @NonNull Runnable unsupportedCb,
++            @NonNull Consumer<Boolean> allowedCb) {
+         final boolean isServiceAllowed = mDeps.isAconfigFlagEnabled(FLAG_NSD_SERVICE_PICKER)
+                 && serviceName != null && serviceType != null
+                 && mAccessRepository.isServiceAllowed(clientInfo.mUid, clientInfo.mPackageName,
+                 serviceName, serviceType);
+ 
++        if (isServiceAllowed && isAtLeastB() && mEnablePicker
++                && mDeps.getRequestedBackend() == TronaNetworkProfile.Backend.TRONA_LEGACY) {
++            // The picker exemption needs an address allowance that this profile
++            // cannot install. Reject before registering a request/data delivery;
++            // ordinary permission-authorized NSD still uses its existing route.
++            unsupportedCb.run();
++            return;
++        }
++
+         // If the service is in the allowlist, no need for permissions.
+         // Otherwise check for local network permission.
+         // NsdService needs to track whether the local network permission or the allowlist is being
+@@ -2004,8 +2018,12 @@ public class NsdService extends INsdManager.Stub {
+                 handleRegisterServiceCallbackAfterPermissionCheck(
+                         clientRequestId, args.serviceInfo, clientInfo, serviceType,
+                         usingPermissionExemption);
+-        checkQueryServicePermissions(
+-                clientInfo, info.getServiceName(), serviceType, disallowedCb, allowedCb);
++        final Runnable unsupportedCb = () ->
++                clientInfo.onServiceInfoCallbackRegistrationFailed(clientRequestId,
++                        NsdManager.FAILURE_INTERNAL_ERROR,
++                        false /* usingLocalNetworkPermission */);
++        checkQueryServicePermissions(clientInfo, info.getServiceName(), serviceType,
++                disallowedCb, unsupportedCb, allowedCb);
+     }
+ 
+     private void handleRegisterServiceCallbackAfterPermissionCheck(int clientRequestId,
+@@ -3025,6 +3043,11 @@ public class NsdService extends INsdManager.Stub {
+                             .FLAG_TETHERING_AND_P2P_GO_LOCAL_AGENT));
+         }
+ 
++        /** Same frozen module profile; this does not select a backend or change a flag. */
++        public TronaNetworkProfile.Backend getRequestedBackend() {
++            return TronaNetworkProfile.getRequestedBackend();
++        }
++
+         /** Get whether a feature config is enabled. */
+         public boolean isAconfigFlagEnabled(String feature) {
+             return switch (feature) {
+diff --git a/service-t/src/com/android/server/net/NetworkStatsFactory.java b/service-t/src/com/android/server/net/NetworkStatsFactory.java
+index 7d48b71..7874ccb 100644
+--- a/service-t/src/com/android/server/net/NetworkStatsFactory.java
++++ b/service-t/src/com/android/server/net/NetworkStatsFactory.java
+@@ -38,6 +38,8 @@ import com.android.internal.annotations.GuardedBy;
+ import com.android.internal.annotations.VisibleForTesting;
+ import com.android.net.module.util.DeviceConfigUtils;
+ import com.android.server.BpfNetMaps;
++import com.android.modules.utils.build.SdkLevel;
++import com.android.server.connectivity.TronaNetworkProfile;
+ import com.android.server.connectivity.InterfaceTracker;
+ 
+ import java.io.IOException;
+@@ -65,6 +67,33 @@ public class NetworkStatsFactory {
+     private final Context mContext;
+ 
+     private final BpfNetMaps mBpfNetMaps;
++    private final LegacyStatsReader mLegacyStatsReader;
++
++    /**
++     * Complete cumulative snapshots from a verified legacy accounting backend.
++     * Reads run under mPersistentDataLock: do not acquire other system-server locks.
++     * Implementations must throw on unavailable or incomplete reads, never return
++     * a successful empty snapshot for an error. No production reader is selected yet.
++     */
++    public interface LegacyStatsReader {
++        @NonNull NetworkStats readDetail() throws IOException;
++        @NonNull NetworkStats readSummaryXt() throws IOException;
++    }
++
++    /** Concrete reader; constructing this does not select it for production. */
++    public static final class QtaguidStatsReader implements LegacyStatsReader {
++        private NetworkStats read(boolean summary) throws IOException {
++            final NetworkStats stats = new NetworkStats(SystemClock.elapsedRealtime(), 0);
++            final int result = nativeReadNetworkStatsLegacy(stats, summary);
++            if (result != 0) {
++                throw new IOException("Failed to read legacy network stats: " + result);
++            }
++            return stats;
++        }
++
++        @Override public NetworkStats readDetail() throws IOException { return read(false); }
++        @Override public NetworkStats readSummaryXt() throws IOException { return read(true); }
++    }
+ 
+     /**
+      * Guards persistent data access in this class
+@@ -103,6 +132,15 @@ public class NetworkStatsFactory {
+      */
+     @VisibleForTesting
+     public static class Dependencies {
++        /** Default remains BPF; capability selection and native reader are separate work. */
++        public LegacyStatsReader getLegacyStatsReader() {
++            if (!SdkLevel.isAtLeastT()) return null;
++            if (TronaNetworkProfile.getRequestedBackend()
++                    != TronaNetworkProfile.Backend.TRONA_LEGACY) return null;
++            TronaNetworkProfile.requireLegacyNativeReady();
++            return new QtaguidStatsReader();
++        }
++
+         /**
+          * Parse detailed statistics from bpf into given {@link NetworkStats} object. Values
+          * are expected to monotonically increase since device boot.
+@@ -199,7 +237,8 @@ public class NetworkStatsFactory {
+ 
+     @VisibleForTesting
+     public NetworkStatsFactory(@NonNull Context ctx, Dependencies deps) {
+-        mBpfNetMaps = deps.createBpfNetMaps(ctx);
++        mLegacyStatsReader = deps.getLegacyStatsReader();
++        mBpfNetMaps = mLegacyStatsReader == null ? deps.createBpfNetMaps(ctx) : null;
+         synchronized (mPersistentDataLock) {
+             mPersistSnapshot = new NetworkStats(SystemClock.elapsedRealtime(), -1);
+             mTunAnd464xlatAdjustedStats = new NetworkStats(SystemClock.elapsedRealtime(), -1);
+@@ -218,7 +257,15 @@ public class NetworkStatsFactory {
+      * device boot, and may include details about inactive interfaces.
+      */
+     public NetworkStats readNetworkStatsSummaryXt() throws IOException {
+-        return mDeps.getNetworkStatsDev();
++        if (mLegacyStatsReader == null) return mDeps.getNetworkStatsDev();
++        synchronized (mPersistentDataLock) {
++            return mLegacyStatsReader.readSummaryXt();
++        }
++    }
++
++    /** Whether this factory uses its immutable cumulative reader selection. */
++    boolean usesLegacyStats() {
++        return mLegacyStatsReader != null;
+     }
+ 
+     public NetworkStats readNetworkStatsDetail() throws IOException {
+@@ -253,6 +300,9 @@ public class NetworkStatsFactory {
+             // Take a reference. If this gets swapped out, we still have the old reference.
+             final UnderlyingNetworkInfo[] vpnArray = mUnderlyingNetworkInfos;
+ 
++            if (mLegacyStatsReader != null) {
++                return readLegacyNetworkStatsDetailLocked(limitUid, limitIfaces, limitTag, vpnArray);
++            }
+             requestSwapActiveStatsMapLocked();
+             // Stats are always read from the inactive map, so they must be read after the
+             // swap
+@@ -288,8 +338,50 @@ public class NetworkStatsFactory {
+         }
+     }
+ 
++    @GuardedBy("mPersistentDataLock")
++    private NetworkStats readLegacyNetworkStatsDetailLocked(int limitUid, String[] limitIfaces,
++            int limitTag, UnderlyingNetworkInfo[] vpnArray) throws IOException {
++        // Unlike BPF, proc counters are cumulative. Keep an owned raw snapshot,
++        // subtract before adjustments, and never add the complete sample again.
++        final NetworkStats snapshot = mLegacyStatsReader.readDetail().clone();
++        // Retained old rows produce empty deltas; they must not reserve fresh tag slots.
++        final NetworkStats diff = snapshot.subtract(mPersistSnapshot).removeEmptyEntries();
++        final SparseArray<SparseBooleanArray> nextTagSets = mUidTagSets.clone();
++        for (int i = 0; i < nextTagSets.size(); i++) {
++            nextTagSets.setValueAt(i, nextTagSets.valueAt(i).clone());
++        }
++        final NetworkStats filteredDiff = mSupportPerUidTagThrottling
++                ? filterStatsByUidTagSets(diff, nextTagSets) : diff;
++        filteredDiff.apply464xlatAdjustments(mStackedIfaces);
++        for (UnderlyingNetworkInfo info : vpnArray) {
++            filteredDiff.migrateTun(info.getOwnerUid(), info.getInterface(),
++                    info.getUnderlyingInterfaces());
++            filteredDiff.filterDebugEntries();
++        }
++        final NetworkStats adjusted = mTunAnd464xlatAdjustedStats.clone();
++        adjusted.combineAllValues(filteredDiff);
++        adjusted.setElapsedRealtime(snapshot.getElapsedRealtime());
++        final NetworkStats result = adjusted.filteredClone(limitUid, limitIfaces, limitTag);
++
++        // Only publish after read, delta, adjustment and return filtering succeed.
++        // The platform subtraction contract clamps negative/reset deltas to zero;
++        // it cannot reconstruct traffic lost between polls or across a reset.
++        mPersistSnapshot = snapshot;
++        mTunAnd464xlatAdjustedStats = adjusted;
++        mUidTagSets.clear();
++        for (int i = 0; i < nextTagSets.size(); i++) {
++            mUidTagSets.put(nextTagSets.keyAt(i), nextTagSets.valueAt(i));
++        }
++        return result;
++    }
++
+     @GuardedBy("mPersistentDataLock")
+     private NetworkStats filterStatsByUidTagSets(NetworkStats stats) {
++        return filterStatsByUidTagSets(stats, mUidTagSets);
++    }
++
++    private NetworkStats filterStatsByUidTagSets(NetworkStats stats,
++            SparseArray<SparseBooleanArray> uidTagSets) {
+         final NetworkStats filteredStats =
+                 new NetworkStats(stats.getElapsedRealtime(), stats.size());
+ 
+@@ -305,14 +397,14 @@ public class NetworkStatsFactory {
+                 continue;
+             }
+ 
+-            SparseBooleanArray tagSet = mUidTagSets.get(uid);
++            SparseBooleanArray tagSet = uidTagSets.get(uid);
+             if (tagSet == null) {
+                 tagSet = new SparseBooleanArray();
+             }
+             if (tagSet.size() < mPerUidTagThrottlingThreshold || tagSet.get(tag)) {
+                 filteredStats.combineValues(entry);
+                 tagSet.put(tag, true);
+-                mUidTagSets.put(uid, tagSet);
++                uidTagSets.put(uid, tagSet);
+             } else {
+                 tooManyTagsUidSet.add(uid);
+             }
+@@ -324,13 +416,17 @@ public class NetworkStatsFactory {
+     }
+ 
+     /**
+-     * Remove stats from {@code mPersistSnapshot} and {@code mTunAnd464xlatAdjustedStats} for the
+-     * given uids.
++     * Remove exported totals and tag budgets for the given UIDs. Keep the cumulative
++     * reader's raw baseline because its kernel counters are deliberately not deleted.
+      */
+     public void removeUidsLocked(int[] uids) {
+         synchronized (mPersistentDataLock) {
+-            mPersistSnapshot.removeUids(uids);
++            // Legacy kernel counters remain cumulative: retain their subtraction baseline.
++            if (!usesLegacyStats()) mPersistSnapshot.removeUids(uids);
+             mTunAnd464xlatAdjustedStats.removeUids(uids);
++            for (int uid : uids) {
++                mUidTagSets.remove(uid);
++            }
+         }
+     }
+ 
+@@ -375,6 +471,9 @@ public class NetworkStatsFactory {
+     @VisibleForTesting
+     public static native int nativeReadNetworkStatsDev(NetworkStats stats);
+ 
++    @VisibleForTesting
++    public static native int nativeReadNetworkStatsLegacy(NetworkStats stats, boolean summary);
++
+     private static ProtocolException protocolExceptionWithCause(String message, Throwable cause) {
+         ProtocolException pe = new ProtocolException(message);
+         pe.initCause(cause);
+diff --git a/service-t/src/com/android/server/net/NetworkStatsService.java b/service-t/src/com/android/server/net/NetworkStatsService.java
+index 14809fb..2c61bdd 100644
+--- a/service-t/src/com/android/server/net/NetworkStatsService.java
++++ b/service-t/src/com/android/server/net/NetworkStatsService.java
+@@ -462,11 +462,17 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
+      * mActiveUidCounterSet to avoid accessing kernel too frequently.
+      */
+     private SparseIntArray mActiveUidCounterSet = new SparseIntArray();
++    @Nullable
+     private final IBpfMap<S32, U8> mUidCounterSetMap;
++    @Nullable
+     private final IBpfMap<S64, CookieTagMapValue> mCookieTagMap;
++    @Nullable
+     private final IBpfMap<StatsMapKey, StatsMapValue> mStatsMapA;
++    @Nullable
+     private final IBpfMap<StatsMapKey, StatsMapValue> mStatsMapB;
++    @Nullable
+     private final IBpfMap<S32, StatsMapValue> mAppUidStatsMap;
++    @Nullable
+     private final IBpfMap<S32, StatsMapValue> mIfaceStatsMap;
+ 
+     /** Data layer operation counters for splicing into other structures. */
+@@ -531,7 +537,7 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
+     @NonNull
+     private final LocationPermissionChecker mLocationPermissionChecker;
+ 
+-    @NonNull
++    @Nullable
+     private final BpfInterfaceMapHelper mInterfaceMapHelper;
+ 
+     @Nullable
+@@ -679,13 +685,14 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
+         mContentObserver = mDeps.makeContentObserver(mHandler, mSettings,
+                 mNetworkStatsSubscriptionsMonitor);
+         mLocationPermissionChecker = mDeps.makeLocationPermissionChecker(mContext);
+-        mInterfaceMapHelper = mDeps.makeBpfInterfaceMapHelper();
+-        mUidCounterSetMap = mDeps.getUidCounterSetMap();
+-        mCookieTagMap = mDeps.getCookieTagMap();
+-        mStatsMapA = mDeps.getStatsMapA();
+-        mStatsMapB = mDeps.getStatsMapB();
+-        mAppUidStatsMap = mDeps.getAppUidStatsMap();
+-        mIfaceStatsMap = mDeps.getIfaceStatsMap();
++        final boolean legacyStats = mStatsFactory.usesLegacyStats();
++        mInterfaceMapHelper = legacyStats ? null : mDeps.makeBpfInterfaceMapHelper();
++        mUidCounterSetMap = legacyStats ? null : mDeps.getUidCounterSetMap();
++        mCookieTagMap = legacyStats ? null : mDeps.getCookieTagMap();
++        mStatsMapA = legacyStats ? null : mDeps.getStatsMapA();
++        mStatsMapB = legacyStats ? null : mDeps.getStatsMapB();
++        mAppUidStatsMap = legacyStats ? null : mDeps.getAppUidStatsMap();
++        mIfaceStatsMap = legacyStats ? null : mDeps.getIfaceStatsMap();
+         // To prevent any possible races, the flag is not allowed to change until rebooting.
+         mSupportEventLogger = mDeps.supportEventLogger(mContext);
+         mStoreTransportTypes =
+@@ -701,7 +708,7 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
+         mBroadcastNetworkStatsUpdatedRateLimitEnabled =
+                 mDeps.enabledBroadcastNetworkStatsUpdatedRateLimiting(mContext);
+ 
+-        mSkDestroyListener = mDeps.makeSkDestroyListener((message) -> {
++        mSkDestroyListener = legacyStats ? null : mDeps.makeSkDestroyListener((message) -> {
+             final StructInetDiagSockId sockId = message.inetDiagMsg.id;
+             try {
+                 mCookieTagMap.deleteEntry(new S64(sockId.cookie));
+@@ -709,7 +716,7 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
+                 Log.e(TAG, "Failed to delete CookieTagMap entry for " + sockId.cookie  + ": " + e);
+             }
+         }, mHandler);
+-        mHandler.post(mSkDestroyListener::start);
++        if (mSkDestroyListener != null) mHandler.post(mSkDestroyListener::start);
+     }
+ 
+     /**
+@@ -1039,6 +1046,34 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
+             return NetworkStatsService.nativeGetIfaceStat(iface);
+         }
+ 
++        /** Returns zero only after an acknowledged legacy counter-set write. */
++        public int nativeSetLegacyCounterSet(int uid, int set) {
++            return NetworkStatsService.nativeSetLegacyCounterSet(uid, set);
++        }
++
++        @Nullable
++        public NetworkStats.Entry nativeGetLegacyUidStat(int uid) {
++            return NetworkStatsService.nativeGetLegacyUidStat(uid);
++        }
++
++        @Nullable
++        public NetworkStats.Entry nativeGetLegacyIfaceStat(String iface) {
++            return NetworkStatsService.nativeGetLegacyIfaceStat(iface);
++        }
++
++        @Nullable
++        public NetworkStats.Entry nativeGetLegacyTotalStat() {
++            return NetworkStatsService.nativeGetLegacyTotalStat();
++        }
++
++        public void nativeRegisterIface(String iface) {
++            NetworkStatsService.nativeRegisterIface(iface);
++        }
++
++        public void nativeInitNetworkTracing() {
++            NetworkStatsService.nativeInitNetworkTracing();
++        }
++
+         /**
+          * Retrieves native network uid statistics for the specified uid.
+          *
+@@ -2048,26 +2083,49 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
+         }
+     }
+ 
+-    private void setKernelCounterSet(int uid, int set) {
++    private void registerStatsIface(String iface) {
++        // qtaguid reports interface names directly; the BPF index map is unused.
++        if (!mStatsFactory.usesLegacyStats()) mDeps.nativeRegisterIface(iface);
++    }
++
++    /** Optional Perfetto BPF tracing; unsupported by the cumulative qtaguid backend. */
++    public void initNetworkTracing() {
++        if (mStatsFactory.usesLegacyStats()) {
++            Log.i(TAG, "Network tracing unavailable with legacy cumulative stats");
++            return;
++        }
++        mDeps.nativeInitNetworkTracing();
++    }
++
++    private boolean setKernelCounterSet(int uid, int set) {
++        if (mStatsFactory.usesLegacyStats()) {
++            final int result = mDeps.nativeSetLegacyCounterSet(uid, set);
++            if (result != 0) Log.w(TAG, "Legacy counter-set update failed: " + result);
++            return result == 0;
++        }
+         if (mUidCounterSetMap == null) {
+             Log.wtf(TAG, "Fail to set UidCounterSet: Null bpf map");
+-            return;
++            return false;
+         }
+ 
+         if (set == SET_DEFAULT) {
+             try {
++                // An already absent entry also represents the default counter set.
+                 mUidCounterSetMap.deleteEntry(new S32(uid));
++                return true;
+             } catch (ErrnoException e) {
+                 Log.w(TAG, "UidCounterSetMap.deleteEntry(" + uid + ") failed with errno: " + e);
++                return false;
+             }
+-            return;
+         }
+ 
+         try {
+             mUidCounterSetMap.updateEntry(new S32(uid), new U8((short) set));
++            return true;
+         } catch (ErrnoException e) {
+             Log.w(TAG, "UidCounterSetMap.updateEntry(" + uid + ", " + set
+                     + ") failed with errno: " + e);
++            return false;
+         }
+     }
+ 
+@@ -2077,9 +2135,13 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
+         synchronized (mStatsLock) {
+             final int set = uidForeground ? SET_FOREGROUND : SET_DEFAULT;
+             final int oldSet = mActiveUidCounterSet.get(uid, SET_DEFAULT);
+-            if (oldSet != set) {
++            // Legacy control writes are idempotent. Reissue even an apparent no-op:
++            // a previous failed/short proc write must not suppress an opposite repair.
++            if ((mStatsFactory.usesLegacyStats() || oldSet != set)
++                    && setKernelCounterSet(uid, set)) {
++                // Keep operation accounting aligned with the acknowledged kernel set.
++                // A later identical notification must retry a failed map update.
+                 mActiveUidCounterSet.put(uid, set);
+-                setKernelCounterSet(uid, set);
+             }
+         }
+     }
+@@ -2213,12 +2275,14 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
+         if (callingUid != android.os.Process.SYSTEM_UID && callingUid != uid) {
+             return null;
+         }
+-        return getStatsResultFromEntryOrNull(mDeps.nativeGetUidStat(uid));
++        return getStatsResultFromEntryOrNull(mStatsFactory.usesLegacyStats()
++                ? mDeps.nativeGetLegacyUidStat(uid) : mDeps.nativeGetUidStat(uid));
+     }
+ 
+     @Nullable
+     private NetworkStats.Entry getIfaceStatsInternal(@NonNull String iface) {
+-        final NetworkStats.Entry entry = mDeps.nativeGetIfaceStat(iface);
++        final NetworkStats.Entry entry = mStatsFactory.usesLegacyStats()
++                ? mDeps.nativeGetLegacyIfaceStat(iface) : mDeps.nativeGetIfaceStat(iface);
+         if (entry == null) {
+             return null;
+         }
+@@ -2245,7 +2309,8 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
+ 
+     @Nullable
+     private NetworkStats.Entry getTotalStatsInternal() {
+-        final NetworkStats.Entry entry = mDeps.nativeGetTotalStat();
++        final NetworkStats.Entry entry = mStatsFactory.usesLegacyStats()
++                ? mDeps.nativeGetLegacyTotalStat() : mDeps.nativeGetTotalStat();
+         if (entry == null) {
+             return null;
+         }
+@@ -2453,7 +2518,7 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
+             // both total usage and UID details.
+             final String baseIface = snapshot.getLinkProperties().getInterfaceName();
+             if (baseIface != null) {
+-                nativeRegisterIface(baseIface);
++                registerStatsIface(baseIface);
+                 findOrCreateNetworkIdentitySet(mActiveIfaces, baseIface).add(ident);
+                 findOrCreateNetworkIdentitySet(mActiveUidIfaces, baseIface).add(ident);
+ 
+@@ -2525,7 +2590,7 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
+                 // baseIface has been handled, so ignore it.
+                 if (TextUtils.equals(baseIface, iface)) continue;
+                 if (iface != null) {
+-                    nativeRegisterIface(iface);
++                    registerStatsIface(iface);
+                     findOrCreateNetworkIdentitySet(mActiveIfaces, iface).add(ident);
+                     findOrCreateNetworkIdentitySet(mActiveUidIfaces, iface).add(ident);
+                     if (isMobile) {
+@@ -2864,6 +2929,9 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
+ 
+         try {
+             mUidCounterSetMap.deleteEntry(new S32(uid));
++            // Publish default only after the kernel entry is gone. A recycled UID
++            // must be able to create a fresh foreground entry later.
++            mActiveUidCounterSet.delete(uid);
+         } catch (ErrnoException e) {
+             logErrorIfNotErrNoent(e, "Failed to delete tag data from uid counter set map");
+         }
+@@ -2889,6 +2957,15 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
+         mUidTagRecorder.removeUidsLocked(uids);
+ 
+         mStatsFactory.removeUidsLocked(uids);
++        if (mStatsFactory.usesLegacyStats()) {
++            // Local-only cleanup: retained kernel rows avoid destructive deletes after UID reuse.
++            // Keep the acknowledged counter-set cache aligned with the unchanged kernel set.
++            mUidOperations.removeUids(uids);
++            for (NetworkStatsProviderCallbackImpl cb : mStatsProviderCbList) {
++                cb.removeUidStats(uids);
++            }
++            return;
++        }
+         // Clear kernel stats associated with UID
+         for (int uid : uids) {
+             deleteKernelTagData(uid);
+@@ -3159,7 +3236,7 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
+             pw.println();
+             pw.println("InterfaceMapHelper:");
+             pw.increaseIndent();
+-            mInterfaceMapHelper.dump(pw);
++            if (mInterfaceMapHelper != null) mInterfaceMapHelper.dump(pw);
+             pw.decreaseIndent();
+ 
+             pw.println();
+@@ -3185,7 +3262,7 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
+             pw.println();
+             pw.println("SkDestroyListener logs:");
+             pw.increaseIndent();
+-            mSkDestroyListener.dump(pw);
++            if (mSkDestroyListener != null) mSkDestroyListener.dump(pw);
+             pw.decreaseIndent();
+ 
+             pw.println();
+@@ -3259,12 +3336,16 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
+     }
+ 
+     private void dumpMapStatus(final IndentingPrintWriter pw) {
++        if (mStatsFactory.usesLegacyStats()) {
++            pw.println("BPF maps unavailable: legacy cumulative stats selected");
++            return;
++        }
+         BpfDump.dumpMapStatus(mCookieTagMap, pw, "mCookieTagMap", COOKIE_TAG_MAP_PATH);
+         BpfDump.dumpMapStatus(mUidCounterSetMap, pw, "mUidCounterSetMap", UID_COUNTERSET_MAP_PATH);
+         BpfDump.dumpMapStatus(mAppUidStatsMap, pw, "mAppUidStatsMap", APP_UID_STATS_MAP_PATH);
+         BpfDump.dumpMapStatus(mStatsMapA, pw, "mStatsMapA", STATS_MAP_A_PATH);
+         BpfDump.dumpMapStatus(mStatsMapB, pw, "mStatsMapB", STATS_MAP_B_PATH);
+-        // mIfaceStatsMap is always not null but dump status to be consistent with other maps.
++        // Modern initialization requires this map; selected legacy returned above.
+         BpfDump.dumpMapStatus(mIfaceStatsMap, pw, "mIfaceStatsMap", IFACE_STATS_MAP_PATH);
+     }
+ 
+@@ -3327,6 +3408,7 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
+ 
+     @GuardedBy("mStatsLock")
+     private void dumpIfaceStatsMapLocked(final IndentingPrintWriter pw) {
++        if (mIfaceStatsMap == null) return;
+         BpfDump.dumpMap(mIfaceStatsMap, pw, "mIfaceStatsMap",
+                 "ifaceIndex ifaceName rxBytes rxPackets txBytes txPackets",
+                 (key, value) -> {
+@@ -3531,6 +3613,13 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
+             }
+         }
+ 
++        void removeUidStats(int[] uids) {
++            synchronized (mProviderStatsLock) {
++                // Provider notifications contain increments, so restart this local UID aggregate.
++                mUidStats.removeUids(uids);
++            }
++        }
++
+         @Override
+         public void notifyStatsUpdated(int token, @Nullable NetworkStats ifaceStats,
+                 @Nullable NetworkStats uidStats) {
+@@ -3698,6 +3787,19 @@ public class NetworkStatsService extends INetworkStatsService.Stub {
+ 
+     // TODO: Read stats by using BpfNetMapsReader.
+     private static native void nativeRegisterIface(String iface);
++    // Private raw control operations. Callers must coordinate permission,
++    // acknowledgement, retries and final-poll/UID deletion before selection.
++    private static native int nativeSetLegacyCounterSet(int uid, int counterSet);
++    private static native int nativeDeleteLegacyUidStats(int uid);
++
++    // Optional legacy readers; common capability selection is not wired yet.
++    @Nullable
++    private static native NetworkStats.Entry nativeGetLegacyTotalStat();
++    @Nullable
++    private static native NetworkStats.Entry nativeGetLegacyIfaceStat(String iface);
++    @Nullable
++    private static native NetworkStats.Entry nativeGetLegacyUidStat(int uid);
++
+     @Nullable
+     private static native NetworkStats.Entry nativeGetTotalStat();
+     @Nullable
+diff --git a/service/Android.bp b/service/Android.bp
+index 3bd1471..1eed71a 100644
+--- a/service/Android.bp
++++ b/service/Android.bp
+@@ -137,12 +137,14 @@ cc_library_shared {
+         "jni/com_android_server_connectivity_BpfEventPoller.cpp",
+         "jni/com_android_server_connectivity_ClatCoordinator.cpp",
+         "jni/com_android_server_connectivity_LocalNetEventListener.cpp",
++        "jni/com_android_server_connectivity_TronaNetworkProfile.cpp",
+         "jni/onload.cpp",
+     ],
+     header_libs: [
+         "bpf_connectivity_headers",
+     ],
+     static_libs: [
++        "libtrona_network_profile",
+         "libclat",
+         "libeventpolling",
+         "libstatslog_connectivity_sdk30",
+@@ -216,6 +218,7 @@ java_library {
+         "modules-utils-shell-command-handler",
+         "net-utils-service-connectivity",
+         "netd-client",
++        "oemnetd_aidl_interface-java",
+         "networkstack-client",
+         "PlatformProperties",
+         "service-connectivity-protos",
+diff --git a/service/jni/com_android_server_connectivity_ClatCoordinator.cpp b/service/jni/com_android_server_connectivity_ClatCoordinator.cpp
+index 70991eb..4aa44cf 100644
+--- a/service/jni/com_android_server_connectivity_ClatCoordinator.cpp
++++ b/service/jni/com_android_server_connectivity_ClatCoordinator.cpp
+@@ -34,6 +34,7 @@
+ #include <unistd.h>
+ 
+ #include <android-modules-utils/sdk_level.h>
++#include <trona/NativeNetworkProfile.h>
+ #include <bpf/BpfMap.h>
+ #include <bpf/BpfUtils.h>
+ #include <netjniutils/netjniutils.h>
+@@ -51,6 +52,28 @@
+ 
+ namespace android {
+ 
++// Owner-authorized retained-kernel development experiment only.
++// Netd pins the trona vendor device and kernel before publishing generation readiness.
++// This permits registration with CLAT unavailable; modern validation stays intact.
++static constexpr bool kTronaLegacyStartupEnabled = true;
++static bool sClatSupported = true;
++
++static int resolveClatProfile(bool* supported) {
++    if (!supported) return -EINVAL;
++    trona::network::RequestedNetworkBackend requested;
++    int error = trona::network::GetRequestedNetworkBackend(&requested);
++    if (error) return error;
++    if (requested == trona::network::RequestedNetworkBackend::Modern) {
++        *supported = true;
++        return 0;
++    }
++    if (!kTronaLegacyStartupEnabled) return -EOPNOTSUPP;
++    error = trona::network::RequireLegacyNativeReady();
++    if (error) return error;
++    *supported = false;  // Translation remains explicitly unsupported.
++    return 0;
++}
++
+ static bool fatal = false;
+ 
+ #define ALOGF(s ...) do { ALOGE(s); fatal = true; } while(0)
+@@ -107,6 +130,17 @@ static void verifyClatPerms() {
+     V(kClatdDir, S_IFDIR|0750, CLAT, SYSTEM, "system_file", DIR);
+     V(kClatdBin, S_IFREG|S_ISUID|S_ISGID|0755, CLAT, CLAT, "clatd_exec", BIN);
+ 
++    // Never hide binary/directory integrity errors behind the deferred capability.
++    if (fatal) abort();
++    bool supported = true;
++    const int profileError = resolveClatProfile(&supported);
++    if (profileError) {
++        ALOGE("Network profile unavailable for CLAT registration: %d", profileError);
++        abort();
++    }
++    sClatSupported = supported;
++    if (!supported) return;
++
+     // Move on to verifying that the bpf programs and maps are as expected.
+     // This relies on the kernel and bpfloader.
+ 
+@@ -532,7 +566,14 @@ static jlong com_android_server_connectivity_ClatCoordinator_getSocketCookie(
+ /*
+  * JNI registration.
+  */
++static jboolean com_android_server_connectivity_ClatCoordinator_isClatSupported(
++        JNIEnv*, jclass) {
++    return sClatSupported;
++}
++
+ static const JNINativeMethod gMethods[] = {
++        {"native_isClatSupported", "()Z",
++         (void*)com_android_server_connectivity_ClatCoordinator_isClatSupported},
+         /* name, signature, funcPtr */
+         {"native_selectIpv4Address", "(Ljava/lang/String;I)Ljava/lang/String;",
+          (void*)com_android_server_connectivity_ClatCoordinator_selectIpv4Address},
+diff --git a/service/jni/com_android_server_connectivity_TronaNetworkProfile.cpp b/service/jni/com_android_server_connectivity_TronaNetworkProfile.cpp
+new file mode 100644
+index 0000000..c974b04
+--- /dev/null
++++ b/service/jni/com_android_server_connectivity_TronaNetworkProfile.cpp
+@@ -0,0 +1,32 @@
++// SPDX-License-Identifier: Apache-2.0
++#include <cerrno>
++#include <nativehelper/JNIHelp.h>
++#include <trona/NativeNetworkProfile.h>
++namespace android {
++static jint getRequestedBackend(JNIEnv*, jclass) {
++    using trona::network::RequestedNetworkBackend;
++    RequestedNetworkBackend backend;
++    const int result = trona::network::GetRequestedNetworkBackend(&backend);
++    if (result != 0) return result < 0 ? result : -EIO;
++    switch (backend) {
++        case RequestedNetworkBackend::Modern: return 0;
++        case RequestedNetworkBackend::TronaLegacy: return 1;
++    }
++    return -EPROTO;
++}
++static jint requireLegacyNativeReady(JNIEnv*, jclass) {
++    const int result = trona::network::RequireLegacyNativeReady();
++    return result <= 0 ? result : -EIO;
++}
++static const JNINativeMethod methods[] = {
++        {const_cast<char*>("nativeGetRequestedBackend"), const_cast<char*>("()I"),
++                (void*)getRequestedBackend},
++        {const_cast<char*>("nativeRequireLegacyNativeReady"), const_cast<char*>("()I"),
++                (void*)requireLegacyNativeReady},
++};
++int register_com_android_server_connectivity_TronaNetworkProfile(JNIEnv* env) {
++    return jniRegisterNativeMethods(env,
++            "android/net/connectivity/com/android/server/connectivity/TronaNetworkProfile",
++            methods, sizeof(methods) / sizeof(methods[0]));
++}
++}
+diff --git a/service/jni/onload.cpp b/service/jni/onload.cpp
+index 3d8809a..0f4aa6a 100644
+--- a/service/jni/onload.cpp
++++ b/service/jni/onload.cpp
+@@ -18,12 +18,14 @@
+ #include <log/log.h>
+ 
+ #include <android-modules-utils/sdk_level.h>
++#include <trona/NativeNetworkProfile.h>
+ 
+ namespace android {
+ 
+ int register_com_android_server_connectivity_BpfEventPoller(JNIEnv *env);
+ int register_com_android_server_connectivity_ClatCoordinator(JNIEnv *env);
+ int register_com_android_server_connectivity_LocalNetEventListener(JNIEnv *env);
++int register_com_android_server_connectivity_TronaNetworkProfile(JNIEnv *env);
+ int register_android_server_net_NetworkStatsFactory(JNIEnv *env);
+ int register_android_server_net_NetworkStatsService(JNIEnv *env);
+ int register_com_android_net_module_util_ServiceConnectivityJni(JNIEnv *env,
+@@ -36,6 +38,10 @@ extern "C" jint JNI_OnLoad(JavaVM* vm, void*) {
+         return JNI_ERR;
+     }
+ 
++    // Capture selection/errors without aborting ahead of clatd integrity checks.
++    // This does not establish or publish legacy-core readiness.
++    trona::network::FreezeNativeNetworkProfile();
++
+     if (android::modules::sdklevel::IsAtLeastT()) {
+         if (register_com_android_server_connectivity_BpfEventPoller(env) < 0) {
+             return JNI_ERR;
+@@ -44,6 +50,9 @@ extern "C" jint JNI_OnLoad(JavaVM* vm, void*) {
+         if (register_com_android_server_connectivity_ClatCoordinator(env) < 0) {
+             return JNI_ERR;
+         }
++        if (register_com_android_server_connectivity_TronaNetworkProfile(env) < 0) {
++            return JNI_ERR;
++        }
+ 
+         if (register_com_android_server_connectivity_LocalNetEventListener(env) < 0) {
+             return JNI_ERR;
+diff --git a/service/src/com/android/server/BpfNetMaps.java b/service/src/com/android/server/BpfNetMaps.java
+index c1a4799..5d29bfa 100644
+--- a/service/src/com/android/server/BpfNetMaps.java
++++ b/service/src/com/android/server/BpfNetMaps.java
+@@ -49,12 +49,14 @@ import static android.net.ConnectivityManager.BLOCKED_REASON_NONE;
+ import static android.net.ConnectivityManager.FIREWALL_RULE_ALLOW;
+ import static android.net.ConnectivityManager.FIREWALL_RULE_DENY;
+ import static android.permission.flags.Flags.accessLocalNetworkPermissionEnabled;
++import static android.system.OsConstants.EAGAIN;
+ import static android.system.OsConstants.EINVAL;
+ import static android.system.OsConstants.ENODEV;
+ import static android.system.OsConstants.ENOENT;
+ import static android.system.OsConstants.ENOMEM;
+ import static android.system.OsConstants.ENOSPC;
+ import static android.system.OsConstants.EOPNOTSUPP;
++import static android.system.OsConstants.EIO;
+ 
+ import static com.android.modules.utils.build.SdkLevel.isAtLeastB;
+ import static com.android.net.module.util.bpf.UidPermissionChunk.CHUNK_INT64_COUNT;
+@@ -103,10 +105,12 @@ import android.net.BpfNetMapsUtils;
+ import android.net.INetd;
+ import android.net.UidOwnerValue;
+ import android.os.Build;
++import android.os.IBinder;
+ import android.os.Process;
+ import android.os.RemoteException;
+ import android.os.ServiceSpecificException;
+ import android.os.UserHandle;
++import android.os.UserManager;
+ import android.system.ErrnoException;
+ import android.system.Os;
+ import android.util.ArrayMap;
+@@ -144,6 +148,9 @@ import com.android.net.module.util.bpf.LocalNetAccessKey;
+ import com.android.net.module.util.bpf.LocalNetUidHostAllowlistKey;
+ import com.android.net.module.util.bpf.UidPermissionChunk;
+ import com.android.server.connectivity.InterfaceTracker;
++import com.android.server.connectivity.TronaUidPolicy;
++import com.android.server.connectivity.TronaNetworkProfile;
++import com.android.internal.net.IOemNetd;
+ 
+ import java.io.File;
+ import java.io.FileDescriptor;
+@@ -171,7 +178,16 @@ public class BpfNetMaps {
+ 
+     private static final String TAG = "BpfNetMaps";
+     private final INetd mNetd;
++    private final Context mContext;
+     private final Dependencies mDeps;
++    @Nullable private final TronaUidPolicy mTronaUidPolicy;
++    // ConnectivityService and NetworkStatsFactory create separate BpfNetMaps
++    // instances. They must share one policy owner in this process/classloader.
++    // The class monitor protects selection, including the disabled/null choice.
++    private static boolean sTronaUidPolicySelected = false;
++    private static boolean sTronaUidPolicyInitializing = false;
++    @Nullable private static TronaUidPolicy sTronaUidPolicy;
++
+     // Use legacy netd for releases before T.
+     private static boolean sInitialized = false;
+ 
+@@ -446,8 +462,13 @@ public class BpfNetMaps {
+      * Set sInitialized for test.
+      */
+     @VisibleForTesting
+-    public static void setInitializedForTest(boolean initialized) {
++    public static synchronized void setInitializedForTest(boolean initialized) {
+         sInitialized = initialized;
++        if (!initialized) {
++            // Test isolation only. Production never replaces an active policy owner.
++            sTronaUidPolicy = null;
++            sTronaUidPolicySelected = false;
++        }
+     }
+ 
+     @RequiresApi(Build.VERSION_CODES.TIRAMISU)
+@@ -815,6 +836,17 @@ public class BpfNetMaps {
+      * Initializes the class if it is not already initialized. This method will open maps but not
+      * cause any other effects. This method may be called multiple times on any thread.
+      */
++    private static synchronized void ensureLegacyInitialized(final Dependencies deps) {
++        if (sInitialized) return;
++        // Preserve actual process-stable flags; capability guards exclude maps.
++        sPermissionMapUidMigrationEnabled = deps.isPermissionMapUidMigrationEnabled();
++        sLoopbackAccessMetricsEnabled = deps.isLoopbackAccessMetricsEnabled();
++        sLoopbackChecksEnabled = deps.isLoopbackChecksEnabled();
++        sBetaMetricsEnabled = deps.isBetaMetricsEnabled();
++        sL4sSupported = false; // This profile loads no modern L4S program.
++        sInitialized = true;
++    }
++
+     private static synchronized void ensureInitialized(final Context context,
+             final Dependencies deps) {
+         if (sInitialized) return;
+@@ -834,6 +866,40 @@ public class BpfNetMaps {
+      */
+     @VisibleForTesting
+     public static class Dependencies {
++        public TronaNetworkProfile.Backend getRequestedBackend() {
++            return TronaNetworkProfile.getRequestedBackend();
++        }
++        public void requireLegacyNativeReady() {
++            TronaNetworkProfile.requireLegacyNativeReady();
++        }
++        public int[] getActiveUserIds(Context context) {
++            final UserManager users = Objects.requireNonNull(
++                    context.getSystemService(UserManager.class), "Missing UserManager");
++            return users.getUserHandles(true).stream().mapToInt(UserHandle::getIdentifier).toArray();
++        }
++        public TronaUidPolicy getLegacyUidPolicy(Context context, INetd suppliedNetd)
++                throws RemoteException {
++            if (context == null) throw new ServiceSpecificException(EAGAIN, "Missing Context");
++            final INetd service = suppliedNetd != null ? suppliedNetd : getNetd(context);
++            if (service == null) throw new ServiceSpecificException(EAGAIN, "Missing native netd");
++            final IOemNetd backend = IOemNetd.Stub.asInterface(service.getOemNetd());
++            if (backend == null) throw new ServiceSpecificException(EAGAIN, "Missing OEM netd");
++            return new TronaUidPolicy(backend, getActiveUserIds(context));
++        }
++
++        /** Use the same supported native-service registry contract as NetworkStatsService. */
++        @Nullable
++        public INetd getNetd(Context context) {
++            if (context == null) return null;
++            return INetd.Stub.asInterface((IBinder) context.getSystemService(Context.NETD_SERVICE));
++        }
++
++        /** Disabled until the complete legacy backend and startup/user lifecycle are ready. */
++        @Nullable
++        public TronaUidPolicy getTronaUidPolicy() {
++            return null;
++        }
++
+         /**
+          * Get interface index.
+          */
+@@ -973,12 +1039,103 @@ public class BpfNetMaps {
+     public BpfNetMaps(final Context context, final INetd netd, final Dependencies deps,
+             @NonNull final  InterfaceTracker interfaceTracker) {
+         Objects.requireNonNull(interfaceTracker);
++        if (SdkLevel.isAtLeastT()
++                && deps.getRequestedBackend() == TronaNetworkProfile.Backend.TRONA_LEGACY) {
++            deps.requireLegacyNativeReady();
++            mNetd = netd;
++            mContext = context;
++            mDeps = deps;
++            mTronaUidPolicy = acquireLegacyUidPolicy(deps, context, netd);
++            ensureLegacyInitialized(deps);
++            mInterfaceTracker = interfaceTracker;
++            return;
++        }
+         ensureInitialized(context, deps);
+         mNetd = netd;
++        mContext = context;
+         mDeps = deps;
++        mTronaUidPolicy = acquireTronaUidPolicy(deps);
+         mInterfaceTracker = interfaceTracker;
+     }
+ 
++    /**
++     * Whether this instance routes UID policy through the immutable legacy client.
++     * This identifies the selected policy owner; it is not whole-backend readiness.
++     */
++    public boolean usesLegacyUidPolicy() {
++        return mTronaUidPolicy != null;
++    }
++
++    /** Apply a complete authoritative lifecycle snapshot before dependent policy work. */
++    public void replaceLegacyActiveUsers(int[] users, @Nullable UserHandle removedUser) {
++        if (!usesLegacyUidPolicy()) return;
++        callTronaUidPolicy(() -> {
++            if (removedUser == null) mTronaUidPolicy.replaceUsers(users);
++            else mTronaUidPolicy.replaceUsersAfterRemoval(users, removedUser.getIdentifier());
++            return null;
++        });
++    }
++
++    private void throwIfLegacyBpfUnsupported(String operation) {
++        if (usesLegacyUidPolicy()) {
++            throw new ServiceSpecificException(EOPNOTSUPP,
++                    operation + " unavailable in legacy profile");
++        }
++    }
++
++    private interface TronaUidCall<T> {
++        T run() throws RemoteException;
++    }
++
++    private <T> T callTronaUidPolicy(TronaUidCall<T> call) {
++        try {
++            return call.run();
++        } catch (RemoteException error) {
++            throw new ServiceSpecificException(EIO,
++                    "Legacy UID policy transport failed: " + error.getMessage());
++        }
++    }
++
++    @Nullable
++    private static synchronized TronaUidPolicy acquireLegacyUidPolicy(final Dependencies deps,
++            final Context context, final INetd netd) {
++        if (sTronaUidPolicySelected) {
++            if (sTronaUidPolicy == null) throw new IllegalStateException("Profile/owner mismatch");
++            return sTronaUidPolicy;
++        }
++        if (sTronaUidPolicyInitializing) throw new IllegalStateException("Reentrant UID owner creation");
++        sTronaUidPolicyInitializing = true;
++        try {
++            final TronaUidPolicy owner = Objects.requireNonNull(
++                    deps.getLegacyUidPolicy(context, netd), "Missing legacy UID owner");
++            sTronaUidPolicy = owner;
++            sTronaUidPolicySelected = true;
++            return owner;
++        } catch (RemoteException error) {
++            throw new ServiceSpecificException(EIO, "Legacy UID bootstrap failed: " + error.getMessage());
++        } finally {
++            sTronaUidPolicyInitializing = false;
++        }
++    }
++
++    private static synchronized TronaUidPolicy acquireTronaUidPolicy(Dependencies deps) {
++        if (sTronaUidPolicySelected) return sTronaUidPolicy;
++        if (sTronaUidPolicyInitializing) {
++            throw new IllegalStateException("Reentrant legacy UID policy initialization");
++        }
++        sTronaUidPolicyInitializing = true;
++        try {
++            // Factory failure publishes no instance; a later constructor may retry
++            // fresh bootstrap. Once selected, even null is immutable in production.
++            final TronaUidPolicy policy = deps.getTronaUidPolicy();
++            sTronaUidPolicy = policy;
++            sTronaUidPolicySelected = true;
++            return policy;
++        } finally {
++            sTronaUidPolicyInitializing = false;
++        }
++    }
++
+     private void maybeThrow(final int err, final String msg) {
+         if (err != 0) {
+             throw new ServiceSpecificException(err, msg + ": " + Os.strerror(err));
+@@ -1082,6 +1239,10 @@ public class BpfNetMaps {
+     @RequiresApi(Build.VERSION_CODES.TIRAMISU)
+     public void setChildChain(final int childChain, final boolean enable) {
+         throwIfPreT("setChildChain is not available on pre-T devices");
++        if (mTronaUidPolicy != null) {
++            callTronaUidPolicy(() -> { mTronaUidPolicy.setChildChain(childChain, enable); return null; });
++            return;
++        }
+ 
+         final long match = getMatchByFirewallChain(childChain);
+         try {
+@@ -1108,6 +1269,9 @@ public class BpfNetMaps {
+     @Deprecated
+     @RequiresApi(Build.VERSION_CODES.TIRAMISU)
+     public boolean isChainEnabled(final int childChain) {
++        if (mTronaUidPolicy != null) {
++            return callTronaUidPolicy(() -> mTronaUidPolicy.isChainEnabled(childChain));
++        }
+         return BpfNetMapsUtils.isChainEnabled(sConfigurationMap, childChain);
+     }
+ 
+@@ -1131,6 +1295,10 @@ public class BpfNetMaps {
+     @RequiresApi(Build.VERSION_CODES.TIRAMISU)
+     public void replaceUidChain(final int chain, final int[] uids) {
+         throwIfPreT("replaceUidChain is not available on pre-T devices");
++        if (mTronaUidPolicy != null) {
++            callTronaUidPolicy(() -> { mTronaUidPolicy.replaceUidChain(chain, uids); return null; });
++            return;
++        }
+ 
+         final long match;
+         try {
+@@ -1179,6 +1347,10 @@ public class BpfNetMaps {
+     @RequiresApi(Build.VERSION_CODES.TIRAMISU)
+     public void setUidRule(final int childChain, final int uid, final int firewallRule) {
+         throwIfPreT("setUidRule is not available on pre-T devices");
++        if (mTronaUidPolicy != null) {
++            callTronaUidPolicy(() -> { mTronaUidPolicy.setUidRule(childChain, uid, firewallRule); return null; });
++            return;
++        }
+ 
+         final long match = getMatchByFirewallChain(childChain);
+         final boolean isAllowList = isFirewallAllowList(childChain);
+@@ -1204,11 +1376,17 @@ public class BpfNetMaps {
+      */
+     @RequiresApi(Build.VERSION_CODES.TIRAMISU)
+     public int getUidRule(final int childChain, final int uid) {
++        if (mTronaUidPolicy != null) {
++            return callTronaUidPolicy(() -> mTronaUidPolicy.getUidRule(childChain, uid));
++        }
+         return BpfNetMapsUtils.getUidRule(sUidOwnerMap, childChain, uid);
+     }
+ 
+     @RequiresApi(Build.VERSION_CODES.TIRAMISU)
+     private Set<Integer> getUidsMatchEnabled(final int childChain) throws ErrnoException {
++        if (mTronaUidPolicy != null) {
++            return callTronaUidPolicy(() -> mTronaUidPolicy.getUidsOnChain(childChain));
++        }
+         final long match = getMatchByFirewallChain(childChain);
+         Set<Integer> uids = new ArraySet<>();
+         synchronized (sUidOwnerMap) {
+@@ -1287,6 +1465,7 @@ public class BpfNetMaps {
+      *                                  cause of the failure.
+      */
+     public void addUidInterfaceRules(final String ifName, final int[] uids) throws RemoteException {
++        throwIfLegacyBpfUnsupported("addUidInterfaceRules");
+         if (!SdkLevel.isAtLeastT()) {
+             mNetd.firewallAddUidInterfaceRules(ifName, uids);
+             return;
+@@ -1325,6 +1504,7 @@ public class BpfNetMaps {
+      *                                  cause of the failure.
+      */
+     public void removeUidInterfaceRules(final int[] uids) throws RemoteException {
++        throwIfLegacyBpfUnsupported("removeUidInterfaceRules");
+         if (!SdkLevel.isAtLeastT()) {
+             mNetd.firewallRemoveUidInterfaceRules(uids);
+             return;
+@@ -1350,6 +1530,7 @@ public class BpfNetMaps {
+     @RequiresApi(Build.VERSION_CODES.TIRAMISU)
+     public void updateUidLockdownRule(final int uid, final boolean add) {
+         throwIfPreT("updateUidLockdownRule is not available on pre-T devices");
++        throwIfLegacyBpfUnsupported("updateUidLockdownRule");
+ 
+         if (add) {
+             addRule(uid, LOCKDOWN_VPN_MATCH, "updateUidLockdownRule");
+@@ -1368,6 +1549,7 @@ public class BpfNetMaps {
+     @RequiresApi(Build.VERSION_CODES.TIRAMISU)
+     public void swapActiveStatsMap() {
+         throwIfPreT("swapActiveStatsMap is not available on pre-T devices");
++        throwIfLegacyBpfUnsupported("swapActiveStatsMap");
+ 
+         try {
+             synchronized (sCurrentStatsMapConfigLock) {
+@@ -1428,6 +1610,7 @@ public class BpfNetMaps {
+      * @throws RemoteException when netd has crashed.
+      */
+     public void setNetPermForUids(final int permissions, final int[] uids) throws RemoteException {
++        throwIfLegacyBpfUnsupported("setNetPermForUids");
+         if (!SdkLevel.isAtLeastT()) {
+             logAndSendNetPermToNetd(permissions, uids);
+             return;
+@@ -1511,6 +1694,7 @@ public class BpfNetMaps {
+         throwIfUidMigrationIsDisabled(
+             "setPermListForUids is not available when flag permission_map_uid_migration" +
+             " is disabled");
++        throwIfLegacyBpfUnsupported("setPermListForUids");
+ 
+         if (!SdkLevel.isAtLeastT()) {
+             setPermListForUidsToNetd(permissionsUids);
+@@ -1547,6 +1731,7 @@ public class BpfNetMaps {
+         throwIfUidMigrationIsDisabled(
+             "setChunkPermListForUids is not available when flag permission_map_uid_migration" +
+             " is disabled");
++        throwIfLegacyBpfUnsupported("setChunkPermListForUids");
+ 
+         // group UIDs by chunkId
+         final ArrayMap<Integer, ArraySet<Integer>> uidsByChunkId = groupPermissionsIdsBy(
+@@ -1683,6 +1868,7 @@ public class BpfNetMaps {
+         throwIfUidMigrationIsDisabled(
+             "removePermissionsForAppId is not available when flag permission_map_uid_migration" +
+             " is disabled");
++        throwIfLegacyBpfUnsupported("removePermissionsForAppId");
+         try {
+             removePermissionsIf(uid -> uid % AID_USER_OFFSET == appId);
+         } catch (RemoteException | ErrnoException e) {
+@@ -1706,6 +1892,7 @@ public class BpfNetMaps {
+         throwIfUidMigrationIsDisabled(
+             "removePermissionsForUserId is not available when flag permission_map_uid_migration" +
+             " is disabled");
++        throwIfLegacyBpfUnsupported("removePermissionsForUserId");
+         try {
+             removePermissionsIf(uid -> uid / AID_USER_OFFSET == userId);
+         } catch (RemoteException | ErrnoException e) {
+@@ -1762,6 +1949,7 @@ public class BpfNetMaps {
+             final InetAddress address, final int protocol, final int remotePort,
+             final boolean isAllowed) {
+         throwIfPre25Q2("addLocalNetAccess is not available on pre-B devices");
++        throwIfLegacyBpfUnsupported("addLocalNetAccess");
+         if (iface == null) {
+             Log.e(TAG, "Null iface, skip addLocalNetAccess for " + address);
+             return;
+@@ -1798,6 +1986,7 @@ public class BpfNetMaps {
+     public void removeLocalNetAccess(final int lpmBitlen, @Nullable final String iface,
+             final InetAddress address, final int protocol, final int remotePort) {
+         throwIfPre25Q2("removeLocalNetAccess is not available on pre-B devices");
++        throwIfLegacyBpfUnsupported("removeLocalNetAccess");
+         final int ifIndex;
+         if (iface == null) {
+             ifIndex = 0;
+@@ -1838,6 +2027,7 @@ public class BpfNetMaps {
+     public boolean getLocalNetAccess(final int lpmBitlen, @Nullable final String iface,
+             final InetAddress address, final int protocol, final int remotePort) {
+         throwIfPre25Q2("getLocalNetAccess is not available on pre-B devices");
++        throwIfLegacyBpfUnsupported("getLocalNetAccess");
+         final int ifIndex;
+         if (iface == null) {
+             ifIndex = 0;
+@@ -1902,6 +2092,7 @@ public class BpfNetMaps {
+     @RequiresApi(Build.VERSION_CODES.CUR_DEVELOPMENT)
+     public void addUidToLocalNetBlockMap(final int uid) {
+         throwIfPre25Q2("addUidToLocalNetBlockMap is not available on pre-B devices");
++        throwIfLegacyBpfUnsupported("addUidToLocalNetBlockMap");
+         try {
+             sLocalNetBlockedUidMap.updateEntry(new U32(uid), new Bool(true));
+         } catch (ErrnoException e) {
+@@ -1916,6 +2107,7 @@ public class BpfNetMaps {
+     @RequiresApi(Build.VERSION_CODES.CUR_DEVELOPMENT)
+     public boolean isUidBlockedFromUsingLocalNetwork(final int uid) {
+         throwIfPre25Q2("isUidBlockedFromUsingLocalNetwork is not available on pre-B devices");
++        throwIfLegacyBpfUnsupported("isUidBlockedFromUsingLocalNetwork");
+         try {
+             final Bool value = sLocalNetBlockedUidMap.getValue(new U32(uid));
+             return value == null ? false : value.val;
+@@ -1933,6 +2125,7 @@ public class BpfNetMaps {
+     @RequiresApi(Build.VERSION_CODES.CUR_DEVELOPMENT)
+     public void removeUidFromLocalNetBlockMap(final int uid) {
+         throwIfPre25Q2("removeUidFromLocalNetBlockMap is not available on pre-B devices");
++        throwIfLegacyBpfUnsupported("removeUidFromLocalNetBlockMap");
+         try {
+             sLocalNetBlockedUidMap.deleteEntry(new U32(uid));
+         } catch (ErrnoException e) {
+@@ -1946,6 +2139,7 @@ public class BpfNetMaps {
+     @RequiresApi(Build.VERSION_CODES.BAKLAVA)
+     public void addLocalNetUidAccess(final int uid, @NonNull final String iface) {
+         throwIfPre25Q2("addLocalNetUidAccess is not available on pre-B devices");
++        throwIfLegacyBpfUnsupported("addLocalNetUidAccess");
+         int ifIndex = mInterfaceTracker.getInterfaceIndex(iface);
+         if (ifIndex == 0) {
+             Log.e(TAG, "Failed to get if index, skip addLocalNetUidAccess for uid: " + uid
+@@ -1967,6 +2161,7 @@ public class BpfNetMaps {
+     @RequiresApi(Build.VERSION_CODES.BAKLAVA)
+     public void removeLocalNetUidAccess(final int uid, @NonNull final String iface) {
+         throwIfPre25Q2("removeLocalNetUidAccess is not available on pre-B devices");
++        throwIfLegacyBpfUnsupported("removeLocalNetUidAccess");
+         final int ifIndex = mInterfaceTracker.getInterfaceIndex(iface);
+         if (ifIndex == 0) {
+             Log.e(TAG, "Failed to get if index, skip removeLocalNetUidAccess for uid: " + uid
+@@ -1994,6 +2189,7 @@ public class BpfNetMaps {
+     public void addLocalNetUidHostAccess(final int uid, final int ifIndex,
+             @NonNull final InetAddress address) {
+         throwIfPre25Q2("addLocalNetUidHostAccess is not available on pre-B devices");
++        throwIfLegacyBpfUnsupported("addLocalNetUidHostAccess");
+         final LocalNetUidHostAllowlistKey key = new LocalNetUidHostAllowlistKey(
+                 uid, ifIndex, address);
+         synchronized (sLocalNetAccessLock) {
+@@ -2009,6 +2205,7 @@ public class BpfNetMaps {
+     @RequiresApi(Build.VERSION_CODES.BAKLAVA)
+     public void removeLocalNetHostAllowlistForInterface(final int ifIndex) {
+         throwIfPre25Q2("removeLocalNetHostAllowlistForInterface is not available on pre-B devices");
++        throwIfLegacyBpfUnsupported("removeLocalNetHostAllowlistForInterface");
+         synchronized (sLocalNetAccessLock) {
+             incrementLnpGenerationId(true);
+             try {
+@@ -2039,6 +2236,7 @@ public class BpfNetMaps {
+      */
+     @RequiresApi(Build.VERSION_CODES.TIRAMISU)
+     public int getNetPermForUid(final int uid) {
++        throwIfLegacyBpfUnsupported("getNetPermForUid");
+         if (isUidMigrationEnabled()) {
+             final int chunkPermissions = getChunkPermForUid(uid);
+             return convertToTrafficPermission(chunkPermissions);
+@@ -2068,6 +2266,7 @@ public class BpfNetMaps {
+         throwIfUidMigrationIsDisabled(
+             "getChunkPermForUid is not available when flag" +
+             " permission_map_uid_migration is disabled");
++        throwIfLegacyBpfUnsupported("getChunkPermForUid");
+         try {
+             UidPermissionChunk uidPermissionChunk = sUidPermissionChunkMap.getValue(
+                 new S32(getChunkId(uid)));
+@@ -2095,6 +2294,23 @@ public class BpfNetMaps {
+     @RequiresApi(Build.VERSION_CODES.TIRAMISU)
+     public void setDataSaverEnabled(boolean enable) {
+         throwIfPreT("setDataSaverEnabled is not available on pre-T devices");
++        if (mTronaUidPolicy != null) {
++            final INetd netd = mNetd != null ? mNetd : mDeps.getNetd(mContext);
++            if (netd == null) {
++                throw new ServiceSpecificException(EAGAIN, "Native netd is not available");
++            }
++            // Always reissue, including apparent no-ops/opposite repairs after failure.
++            // IPv4 may already have changed when IPv6 fails; no decision cache here.
++            try {
++                if (!netd.bandwidthEnableDataSaver(enable)) {
++                    throw new ServiceSpecificException(EIO, "Native Data Saver update not acknowledged");
++                }
++            } catch (RemoteException error) {
++                throw new ServiceSpecificException(EIO, "Native Data Saver transport failed: "
++                        + error.getMessage());
++            }
++            return;
++        }
+ 
+         try {
+             final short config = enable ? DATA_SAVER_ENABLED : DATA_SAVER_DISABLED;
+@@ -2114,6 +2330,7 @@ public class BpfNetMaps {
+     @RequiresApi(Build.VERSION_CODES.TIRAMISU)
+     public void setIngressDiscardRule(final InetAddress address, final String iface) {
+         throwIfPreT("setIngressDiscardRule is not available on pre-T devices");
++        throwIfLegacyBpfUnsupported("setIngressDiscardRule");
+         final int ifIndex = mDeps.getIfIndex(iface);
+         if (ifIndex == 0) {
+             Log.e(TAG, "Failed to get if index, skip setting ingress discard rule for " + address
+@@ -2137,6 +2354,7 @@ public class BpfNetMaps {
+     @RequiresApi(Build.VERSION_CODES.TIRAMISU)
+     public void removeIngressDiscardRule(final InetAddress address) {
+         throwIfPreT("removeIngressDiscardRule is not available on pre-T devices");
++        throwIfLegacyBpfUnsupported("removeIngressDiscardRule");
+         try {
+             sIngressDiscardMap.deleteEntry(new IngressDiscardKey(address));
+         } catch (ErrnoException e) {
+@@ -2152,6 +2370,9 @@ public class BpfNetMaps {
+      */
+     @RequiresApi(Build.VERSION_CODES.TIRAMISU)
+     public int getUidNetworkingBlockedReasons(final int uid) {
++        if (mTronaUidPolicy != null) {
++            return callTronaUidPolicy(() -> mTronaUidPolicy.getUidNetworkingBlockedReasons(uid));
++        }
+         return BpfNetMapsUtils.getUidNetworkingBlockedReasons(uid,
+                 sConfigurationMap, sUidOwnerMap, sDataSaverEnabledMap);
+     }
+@@ -2183,6 +2404,11 @@ public class BpfNetMaps {
+      */
+     @RequiresApi(Build.VERSION_CODES.TIRAMISU)
+     public boolean isUidNetworkingBlocked(final int uid, boolean isNetworkMetered) {
++        if (mTronaUidPolicy != null) {
++            final int reasons = getUidNetworkingBlockedReasons(uid);
++            return isNetworkMetered ? reasons != BLOCKED_REASON_NONE
++                    : (reasons & ~BLOCKED_METERED_REASON_MASK) != BLOCKED_REASON_NONE;
++        }
+         return BpfNetMapsUtils.isUidNetworkingBlocked(uid, isNetworkMetered,
+                 sConfigurationMap, sUidOwnerMap, sDataSaverEnabledMap);
+     }
+@@ -2191,6 +2417,7 @@ public class BpfNetMaps {
+     @RequiresApi(Build.VERSION_CODES.TIRAMISU)
+     public void setPullAtomCallback(final Context context) {
+         throwIfPreT("setPullAtomCallback is not available on pre-T devices");
++        throwIfLegacyBpfUnsupported("setPullAtomCallback");
+ 
+         final StatsManager statsManager = context.getSystemService(StatsManager.class);
+         statsManager.setPullAtomCallback(NETWORK_BPF_MAP_INFO, null /* metadata */,
+@@ -2218,6 +2445,7 @@ public class BpfNetMaps {
+     /** Callback for StatsManager#setPullAtomCallback */
+     @VisibleForTesting
+     public int pullBpfMapInfoAtom(final int atomTag, final List<StatsEvent> data) {
++        if (usesLegacyUidPolicy()) return StatsManager.PULL_SKIP;
+         if (atomTag != NETWORK_BPF_MAP_INFO) {
+             Log.e(TAG, "Unexpected atom tag: " + atomTag);
+             return StatsManager.PULL_SKIP;
+@@ -2460,6 +2688,10 @@ public class BpfNetMaps {
+     @RequiresApi(Build.VERSION_CODES.TIRAMISU)
+     public void dump(final IndentingPrintWriter pw, final FileDescriptor fd, boolean verbose)
+             throws IOException, ServiceSpecificException {
++        if (usesLegacyUidPolicy()) {
++            pw.println("BPF maps unavailable: selected legacy UID/accounting profile");
++            return;
++        }
+         if (!SdkLevel.isAtLeastT()) {
+             throw new ServiceSpecificException(
+                     EOPNOTSUPP, "dumpsys connectivity trafficcontroller dump not available on pre-T"
+diff --git a/service/src/com/android/server/ConnectivityService.java b/service/src/com/android/server/ConnectivityService.java
+index 7682d50..ae946d0 100644
+--- a/service/src/com/android/server/ConnectivityService.java
++++ b/service/src/com/android/server/ConnectivityService.java
+@@ -19,6 +19,7 @@ package com.android.server;
+ import static android.net.NetworkCapabilities.NET_CAPABILITY_PRIORITIZE_BANDWIDTH;
+ import static android.net.NetworkCapabilities.NET_CAPABILITY_PRIORITIZE_LATENCY;
+ import static android.net.NetworkCapabilities.NET_CAPABILITY_PRIORITIZE_UNIFIED_COMMUNICATIONS;
++import static android.Manifest.permission.INTERNET;
+ import static android.Manifest.permission.RECEIVE_DATA_ACTIVITY_CHANGE;
+ import static android.app.ActivityManager.UidFrozenStateChangedCallback.UID_FROZEN_STATE_FROZEN;
+ import static android.content.pm.PackageManager.FEATURE_BLUETOOTH;
+@@ -2655,7 +2656,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
+                 ? mDeps.makeMultiProxyTracker(mContext, mHandler)
+                 : mDeps.makeProxyTracker(mContext, mHandler);
+ 
+-        if (mDeps.isAtLeastB()) {
++        if (mDeps.isAtLeastB() && usesModernBpfFeatures()) {
+             mLocalNetEventListener = mDeps.getLocalNetEventListener(
+                     mContext,
+                     mHandler.getLooper(),
+@@ -3136,8 +3137,15 @@ public class ConnectivityService extends IConnectivityManager.Stub
+         return nai;
+     }
+ 
++    private boolean usesModernBpfFeatures() {
++        return !mBpfNetMaps.usesLegacyUidPolicy();
++    }
++
+     @RequiresApi(Build.VERSION_CODES.TIRAMISU)
+     private boolean hasInternetPermission(final int uid) {
++        if (mBpfNetMaps.usesLegacyUidPolicy()) {
++            return mContext.checkPermission(INTERNET, -1, uid) == PERMISSION_GRANTED;
++        }
+         return (mBpfNetMaps.getNetPermForUid(uid) & PERMISSION_INTERNET) != 0;
+     }
+ 
+@@ -3157,7 +3165,8 @@ public class ConnectivityService extends IConnectivityManager.Stub
+             final boolean metered = nc == null ? true : nc.isMetered();
+             if (mDeps.isAtLeastV()) {
+                 final boolean hasInternetPermission = hasInternetPermission(uid);
+-                final boolean blockedByUidRules = mBpfNetMaps.isUidNetworkingBlocked(uid, metered);
++                final boolean blockedByUidRules =
++                        mBpfNetMaps.isUidNetworkingBlocked(uid, metered);
+                 if (mDeps.isChangeEnabled(NETWORK_BLOCKED_WITHOUT_INTERNET_PERMISSION, uid)) {
+                     return blockedByUidRules || !hasInternetPermission;
+                 } else {
+@@ -5073,7 +5082,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
+         }
+ 
+         // On T+ devices, register callback for statsd to pull NETWORK_BPF_MAP_INFO atom
+-        if (mDeps.isAtLeastT()) {
++        if (mDeps.isAtLeastT() && usesModernBpfFeatures()) {
+             mBpfNetMaps.setPullAtomCallback(mContext);
+         }
+         ConnectivitySampleMetricsHelper.start(mContext, mHandler,
+@@ -5082,7 +5091,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
+             mSatisfiedByLocalNetworkMetrics.start();
+         }
+ 
+-        if (mBpfNetMaps.isLoopbackAccessMetricsEnabled()) {
++        if (usesModernBpfFeatures() && mBpfNetMaps.isLoopbackAccessMetricsEnabled()) {
+             BpfEventPoller.nativeInitLoopbackEventConsumer();
+         }
+ 
+@@ -5091,7 +5100,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
+         }
+ 
+         // Clear all clsact stubs on all interfaces.
+-        mHandler.post(() -> maybeClearTcQdiscClsact());
++        if (usesModernBpfFeatures()) mHandler.post(() -> maybeClearTcQdiscClsact());
+ 
+         // Wait PermissionMonitor to finish the permission update. Then MultipathPolicyTracker won't
+         // have permission problem. While CV#block() is unbounded in time and can in principle block
+@@ -6817,7 +6826,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
+         // Removes the interfaces associated with the network being destroyed from the tracker.
+         for (String interfaceName : nai.linkProperties.getAllInterfaceNames()) {
+             final int ifIndex = mInterfaceTracker.removeInterface(interfaceName);
+-            if (ifIndex != 0 && mDeps.isAtLeastB()) {
++            if (ifIndex != 0 && mDeps.isAtLeastB() && usesModernBpfFeatures()) {
+                 mBpfNetMaps.removeLocalNetHostAllowlistForInterface(ifIndex);
+             }
+         }
+@@ -7531,6 +7540,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
+ 
+     private void updateLocalNetUidAllowlist(@NonNull NetworkAgentInfo nai,
+             @NonNull Set<Integer> oldUids, @NonNull Set<Integer> newUids) {
++        if (!usesModernBpfFeatures()) return;
+         if (!mDeps.isAtLeastB()) return;
+         // Stacked interfaces are not supported, as they are only for clat at the moment and there
+         // are no local prefixes on clat.
+@@ -8761,6 +8771,11 @@ public class ConnectivityService extends IConnectivityManager.Stub
+     @Override
+     public void setRequireVpnForUids(boolean requireVpn, UidRange[] ranges) {
+         enforceNetworkStackOrSettingsPermission();
++        if (requireVpn && ranges != null && ranges.length != 0
++                && !usesModernBpfFeatures()) {
++            throw new ServiceSpecificException(
++                    OsConstants.EOPNOTSUPP, "VPN lockdown is unavailable");
++        }
+         mHandler.sendMessage(mHandler.obtainMessage(EVENT_SET_REQUIRE_VPN_FOR_UIDS,
+                 encodeBool(requireVpn), 0 /* arg2 */, ranges));
+     }
+@@ -8908,8 +8923,18 @@ public class ConnectivityService extends IConnectivityManager.Stub
+         }
+     }
+ 
++    private void updateLegacyActiveUsers(@Nullable UserHandle removedUser) {
++        if (!mBpfNetMaps.usesLegacyUidPolicy()) return;
++        final int[] users = mUserManager.getUserHandles(true /* excludeDying */).stream()
++                .mapToInt(UserHandle::getIdentifier).toArray();
++        // Keep the current full snapshot and the removal incarnation fact together,
++        // including when UserManager already contains a re-added user ID.
++        mBpfNetMaps.replaceLegacyActiveUsers(users, removedUser);
++    }
++
+     @Override
+     public void onUserAdded(@NonNull final UserHandle user) {
++        updateLegacyActiveUsers(null);
+         if (mOemNetworkPreferences.getNetworkPreferences().size() > 0) {
+             handleSetOemNetworkPreference(mOemNetworkPreferences, null);
+         }
+@@ -8927,6 +8952,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
+ 
+     @Override
+     public void onUserRemoved(@NonNull final UserHandle user) {
++        updateLegacyActiveUsers(user);
+         // If there was a network preference for this user, remove it.
+         handleSetProfileNetworkPreference(
+                 List.of(new ProfileNetworkPreferenceInfo(user, null, true,
+@@ -10784,6 +10810,11 @@ public class ConnectivityService extends IConnectivityManager.Stub
+                                     ? ", CONNECTIVITY_USE_RESTRICTED_NETWORKS"
+                                     : "")));
+         }
++        if (!usesModernBpfFeatures()
++                && networkCapabilities.hasTransport(TRANSPORT_VPN)) {
++            throw new ServiceSpecificException(
++                    OsConstants.EOPNOTSUPP, "VPN transport is unavailable");
++        }
+         final boolean hasLocalCap =
+                 networkCapabilities.hasCapability(NET_CAPABILITY_LOCAL_NETWORK);
+         if (hasLocalCap && !areLocalAgentsSupported()) {
+@@ -11254,6 +11285,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
+ 
+     private void maybeModifyQdiscClsact(
+             @NonNull String iface, @NonNull NetworkAgentInfo nai, Boolean add) {
++        if (!usesModernBpfFeatures()) return;
+         if (!mDeps.flagConnectivityServiceModifyQdiscClsact()) return;
+         // The clsact attaching of v4- tun interface is triggered by ClatdCoordinator::maybeStartBpf
+         // because the clat is started before the v4- interface is added to the network and the
+@@ -11372,6 +11404,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
+     @RequiresApi(Build.VERSION_CODES.BAKLAVA)
+     private void updateLocalNetUidAccessForInterfaceAdded(final @NonNull String ifName,
+             final @NonNull NetworkAgentInfo nai) {
++        if (!usesModernBpfFeatures()) return;
+         for (int uid : nai.getCaptivePortalDelegateUids()) {
+             mBpfNetMaps.addLocalNetUidAccess(uid, ifName);
+         }
+@@ -11419,7 +11452,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
+             }
+             final int ifIndex = mInterfaceTracker.removeInterface(iface);
+             // Local protection maps are B+ (developer opt-in on B).
+-            if (ifIndex != 0 && mDeps.isAtLeastB()) {
++            if (ifIndex != 0 && mDeps.isAtLeastB() && usesModernBpfFeatures()) {
+                 mBpfNetMaps.removeLocalNetHostAllowlistForInterface(ifIndex);
+             }
+         }
+@@ -11452,6 +11485,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
+             boolean newHasGlobalProxy,
+             boolean oldHasGlobalProxy,
+             @NonNull final NetworkAgentInfo nai) {
++        if (!usesModernBpfFeatures()) return;
+ 
+         // The maps are available only after 25Q2 release
+         // Skip this for restricted networks on automotive devices until we have a way to identify
+@@ -11785,6 +11819,9 @@ public class ConnectivityService extends IConnectivityManager.Stub
+         if (!mDeps.isAtLeastB()) {
+             throw new UnsupportedOperationException("allowLocalNetAccess is only available on B+");
+         }
++        if (!usesModernBpfFeatures()) {
++            throw new UnsupportedOperationException("Local network access control unavailable in legacy profile");
++        }
+ 
+         // Optimistically add entries in the allowlist map synchronously (not on the handler thread)
+         // so callers can rely on the allowlist being in place when this returns.
+@@ -12034,6 +12071,7 @@ public class ConnectivityService extends IConnectivityManager.Stub
+ 
+     private void updateIngressToVpnAddressFiltering(@Nullable LinkProperties newLp,
+             @Nullable LinkProperties oldLp, @NonNull NetworkAgentInfo nai) {
++        if (!usesModernBpfFeatures()) return;
+         // Having isAtleastT to avoid NewApi linter error (b/303382209)
+         if (!mIngressToVpnAddressFiltering || !mDeps.isAtLeastT()) {
+             return;
+diff --git a/service/src/com/android/server/connectivity/ClatCoordinator.java b/service/src/com/android/server/connectivity/ClatCoordinator.java
+index 8266a87..e11420c 100644
+--- a/service/src/com/android/server/connectivity/ClatCoordinator.java
++++ b/service/src/com/android/server/connectivity/ClatCoordinator.java
+@@ -19,6 +19,7 @@ package com.android.server.connectivity;
+ import static android.net.INetd.IF_STATE_UP;
+ import static android.net.INetd.PERMISSION_NETWORK;
+ import static android.net.INetd.PERMISSION_SYSTEM;
++import static android.system.OsConstants.EOPNOTSUPP;
+ import static android.system.OsConstants.ETH_P_IP;
+ import static android.system.OsConstants.ETH_P_IPV6;
+ 
+@@ -127,6 +128,7 @@ public class ClatCoordinator {
+ 
+     @NonNull
+     private final INetd mNetd;
++    private final boolean mClatSupported;
+     @NonNull
+     private final Dependencies mDeps;
+     @Nullable
+@@ -144,6 +146,11 @@ public class ClatCoordinator {
+      */
+     @VisibleForTesting
+     public abstract static class Dependencies {
++        /** Native process-immutable capability; default remains modern CLAT. */
++        public boolean isClatSupported() {
++            return native_isClatSupported();
++        }
++
+         /**
+           * Get netd.
+           */
+@@ -398,9 +405,15 @@ public class ClatCoordinator {
+     public ClatCoordinator(@NonNull Dependencies deps) {
+         mDeps = deps;
+         mNetd = mDeps.getNetd();
+-        mIngressMap = mDeps.getBpfIngress6Map();
+-        mEgressMap = mDeps.getBpfEgress4Map();
+-        mCookieTagMap = mDeps.getBpfCookieTagMap();
++        mClatSupported = mDeps.isClatSupported();
++        mIngressMap = mClatSupported ? mDeps.getBpfIngress6Map() : null;
++        mEgressMap = mClatSupported ? mDeps.getBpfEgress4Map() : null;
++        mCookieTagMap = mClatSupported ? mDeps.getBpfCookieTagMap() : null;
++    }
++
++    /** Whether this process profile implements local CLAT translation. */
++    public boolean isClatSupported() {
++        return mClatSupported;
+     }
+ 
+     // Note that this may only be called on a brand new v4-* interface,
+@@ -575,6 +588,11 @@ public class ClatCoordinator {
+     public String clatStart(final String iface, final int netId,
+             @NonNull final IpPrefix nat64Prefix)
+             throws IOException {
++        // Reject before address selection, sockets, TUN, rules, tagging or child creation.
++        if (!mClatSupported) {
++            throw new IOException("Legacy CLAT translation unsupported",
++                    new ErrnoException("clatStart", EOPNOTSUPP));
++        }
+         if (isStarted()) {
+             throw new IOException("Clatd is already running on " + mClatdTracker.iface
+                     + " (pid " + mClatdTracker.pid + ")");
+@@ -862,6 +880,7 @@ public class ClatCoordinator {
+         return mClatdTracker;
+     }
+ 
++    private static native boolean native_isClatSupported();
+     private static native String native_selectIpv4Address(String v4addr, int prefixlen)
+             throws IOException;
+     private static native String native_generateIpv6Address(String iface, String v4,
+diff --git a/service/src/com/android/server/connectivity/Nat464Xlat.java b/service/src/com/android/server/connectivity/Nat464Xlat.java
+index 37aef22..17d755b 100644
+--- a/service/src/com/android/server/connectivity/Nat464Xlat.java
++++ b/service/src/com/android/server/connectivity/Nat464Xlat.java
+@@ -133,6 +133,8 @@ public class Nat464Xlat {
+      */
+     @VisibleForTesting
+     protected boolean requiresClat(NetworkAgentInfo nai) {
++        // A process-immutable unsupported capability must not enter a start/error loop.
++        if (mClatCoordinator != null && !mClatCoordinator.isClatSupported()) return false;
+         // TODO: migrate to NetworkCapabilities.TRANSPORT_*.
+         final boolean supported = contains(NETWORK_TYPES, nai.networkInfo.getType());
+         final boolean connected = contains(NETWORK_STATES, nai.networkInfo.getState());
+@@ -204,12 +206,16 @@ public class Nat464Xlat {
+                 addrStr = mClatCoordinator.clatStart(baseIface, getNetId(), mNat64PrefixInUse);
+             } catch (IOException e) {
+                 Log.e(TAG, "Error starting clatd on " + baseIface, e);
++                mNat64PrefixInUse = null;
++                return;
+             }
+         } else {
+             try {
+                 addrStr = mNetd.clatdStart(baseIface, mNat64PrefixInUse.toString());
+             } catch (RemoteException | ServiceSpecificException e) {
+                 Log.e(TAG, "Error starting clatd on " + baseIface, e);
++                mNat64PrefixInUse = null;
++                return;
+             }
+         }
+         mIface = CLAT_PREFIX + baseIface;
+@@ -272,7 +278,6 @@ public class Nat464Xlat {
+             Log.e(TAG, "startClat: Can't start clat on null interface");
+             return;
+         }
+-        // TODO: should we only do this if mNetd.clatdStart() succeeds?
+         Log.i(TAG, "Starting clatd on " + baseIface);
+         enterStartingState(baseIface);
+     }
+diff --git a/service/src/com/android/server/connectivity/PermissionMonitor.java b/service/src/com/android/server/connectivity/PermissionMonitor.java
+index 0f88270..75cf336 100755
+--- a/service/src/com/android/server/connectivity/PermissionMonitor.java
++++ b/service/src/com/android/server/connectivity/PermissionMonitor.java
+@@ -419,6 +419,10 @@ public class PermissionMonitor {
+         }
+     }
+ 
++    private boolean usesBpfPermissionMirror() {
++        return !mBpfNetMaps.usesLegacyUidPolicy();
++    }
++
+     private boolean shouldEnforceLocalNetRestrictions(int uid) {
+         return mDeps.isOptedInToLocalNetworkRestrictions(uid)
+             || mDeps.isAccessLocalNetworkPermissionEnabled();
+@@ -476,7 +480,12 @@ public class PermissionMonitor {
+         mBpfNetMaps = bpfNetMaps;
+         mThread = thread;
+         mIsLoopbackPermissionEnabled = mDeps.isLoopbackPermissionEnabled();
+-        if (isAtLeastB() && !mBpfNetMaps.isPermissionPropagationEnabled()) {
++        if (!usesBpfPermissionMirror()) {
++            Log.i(TAG, "Legacy profile: platform GIDs/native tag authority; local/loopback "
++                    + "BPF enforcement unavailable");
++        }
++        if (isAtLeastB() && usesBpfPermissionMirror()
++                && !mBpfNetMaps.isPermissionPropagationEnabled()) {
+             // Local net restrictions is supported as a developer opt-in starting in Android B.
+             // This listener should finish registration by the time the system has completed
+             // boot setup such that any changes to runtime permissions for local network
+@@ -484,7 +493,7 @@ public class PermissionMonitor {
+             mPackageManager.addOnPermissionsChangeListener(mPermissionChangeListener);
+         }
+ 
+-        if (mBpfNetMaps.isPermissionPropagationEnabled()) {
++        if (usesBpfPermissionMirror() && mBpfNetMaps.isPermissionPropagationEnabled()) {
+             mDeps.registerBpfMap(
+                     (SparseIntArray uidsPermissionBits) -> { /* setUidsPermissionBits */
+                         long startTimeNanos = SystemClock.elapsedRealtimeNanos();
+@@ -539,6 +548,7 @@ public class PermissionMonitor {
+ 
+     @VisibleForTesting
+     void setLocalNetworkPermissions(final int uid, @Nullable final String packageName) {
++        if (!usesBpfPermissionMirror()) return;
+         if (!shouldEnforceLocalNetRestrictions(uid)
+                 || mBpfNetMaps.isPermissionPropagationEnabled()) {
+             return;
+@@ -989,7 +999,7 @@ public class PermissionMonitor {
+             final int uid = allUids.keyAt(i);
+             if (user.equals(UserHandle.getUserHandleForUid(uid))) {
+                 mUidToNetworkPerm.delete(uid);
+-                if (shouldEnforceLocalNetRestrictions(uid)
++                if (shouldEnforceLocalNetRestrictions(uid) && usesBpfPermissionMirror()
+                         && !mBpfNetMaps.isPermissionPropagationEnabled()) {
+                     mBpfNetMaps.removeUidFromLocalNetBlockMap(uid);
+                     if (hasSdkSandbox(uid)) mBpfNetMaps.removeUidFromLocalNetBlockMap(
+@@ -1323,7 +1333,8 @@ public class PermissionMonitor {
+                     + ", tPerm=" + permissionToString(trafficPermission));
+         }
+ 
+-        if (isAtLeastB() && !mBpfNetMaps.isPermissionPropagationEnabled()) {
++        if (isAtLeastB() && usesBpfPermissionMirror()
++                && !mBpfNetMaps.isPermissionPropagationEnabled()) {
+             mBpfNetMaps.removeUidFromLocalNetBlockMap(uid);
+             if (hasSdkSandbox(uid)) mBpfNetMaps.removeUidFromLocalNetBlockMap(
+                     Process.toSdkSandboxUid(uid));
+@@ -1701,6 +1712,7 @@ public class PermissionMonitor {
+     @VisibleForTesting
+     void sendUidsTrafficPermission(SparseIntArray allUserTrafficPermissions) {
+         ensureRunningOnHandlerThread();
++        if (!usesBpfPermissionMirror()) return;
+         try {
+             mBpfNetMaps.setPermListForUids(allUserTrafficPermissions);
+         } catch (RemoteException | ServiceSpecificException e) {
+@@ -1717,6 +1729,7 @@ public class PermissionMonitor {
+     @VisibleForTesting
+     void sendAppIdsTrafficPermission(SparseIntArray netdPermissionsAppIds) {
+         ensureRunningOnHandlerThread();
++        if (!usesBpfPermissionMirror()) return;
+         final ArrayList<Integer> allPermissionAppIds = new ArrayList<>();
+         final ArrayList<Integer> internetPermissionAppIds = new ArrayList<>();
+         final ArrayList<Integer> updateStatsPermissionAppIds = new ArrayList<>();
+diff --git a/service/src/com/android/server/connectivity/TronaNetworkProfile.java b/service/src/com/android/server/connectivity/TronaNetworkProfile.java
+new file mode 100644
+index 0000000..a14e4da
+--- /dev/null
++++ b/service/src/com/android/server/connectivity/TronaNetworkProfile.java
+@@ -0,0 +1,28 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.android.server.connectivity;
++import android.os.ServiceSpecificException;
++
++/** Read-only frozen native request. A requested backend is not readiness. */
++public final class TronaNetworkProfile {
++    public enum Backend { MODERN, TRONA_LEGACY }
++    private TronaNetworkProfile() {}
++    // JNI can load/register this outer class without invoking any native method.
++    private static final class Requested {
++        static final int VALUE = nativeGetRequestedBackend();
++    }
++    public static Backend getRequestedBackend() {
++        final int value = Requested.VALUE;
++        if (value < 0) throw new ServiceSpecificException(-value, "Invalid native network profile");
++        if (value == 0) return Backend.MODERN;
++        if (value == 1) return Backend.TRONA_LEGACY;
++        throw new IllegalStateException("Invalid native profile value: " + value);
++    }
++    /** Fresh check only; publishes nothing and creates no UID owner. */
++    public static void requireLegacyNativeReady() {
++        final int result = nativeRequireLegacyNativeReady();
++        if (result < 0) throw new ServiceSpecificException(-result, "Legacy native core unavailable");
++        if (result != 0) throw new IllegalStateException("Invalid ready status: " + result);
++    }
++    private static native int nativeGetRequestedBackend();
++    private static native int nativeRequireLegacyNativeReady();
++}
+diff --git a/service/src/com/android/server/connectivity/TronaUidPolicy.java b/service/src/com/android/server/connectivity/TronaUidPolicy.java
+new file mode 100644
+index 0000000..ca32ee9
+--- /dev/null
++++ b/service/src/com/android/server/connectivity/TronaUidPolicy.java
+@@ -0,0 +1,366 @@
++// SPDX-License-Identifier: Apache-2.0
++package com.android.server.connectivity;
++
++import static android.net.ConnectivityManager.FIREWALL_CHAIN_BACKGROUND;
++import static android.net.ConnectivityManager.FIREWALL_CHAIN_DOZABLE;
++import static android.net.ConnectivityManager.FIREWALL_CHAIN_LOW_POWER_STANDBY;
++import static android.net.ConnectivityManager.FIREWALL_CHAIN_METERED_ALLOW;
++import static android.net.ConnectivityManager.FIREWALL_CHAIN_METERED_DENY_ADMIN;
++import static android.net.ConnectivityManager.FIREWALL_CHAIN_METERED_DENY_USER;
++import static android.net.ConnectivityManager.FIREWALL_CHAIN_OEM_DENY_1;
++import static android.net.ConnectivityManager.FIREWALL_CHAIN_OEM_DENY_2;
++import static android.net.ConnectivityManager.FIREWALL_CHAIN_OEM_DENY_3;
++import static android.net.ConnectivityManager.FIREWALL_CHAIN_POWERSAVE;
++import static android.net.ConnectivityManager.FIREWALL_CHAIN_RESTRICTED;
++import static android.net.ConnectivityManager.FIREWALL_CHAIN_STANDBY;
++import static android.net.ConnectivityManager.FIREWALL_RULE_ALLOW;
++import static android.net.ConnectivityManager.FIREWALL_RULE_DENY;
++
++import static android.net.ConnectivityManager.BLOCKED_REASON_NONE;
++import static android.net.ConnectivityManager.BLOCKED_REASON_BATTERY_SAVER;
++import static android.net.ConnectivityManager.BLOCKED_REASON_DOZE;
++import static android.net.ConnectivityManager.BLOCKED_REASON_APP_STANDBY;
++import static android.net.ConnectivityManager.BLOCKED_REASON_RESTRICTED_MODE;
++import static android.net.ConnectivityManager.BLOCKED_REASON_LOW_POWER_STANDBY;
++import static android.net.ConnectivityManager.BLOCKED_REASON_APP_BACKGROUND;
++import static android.net.ConnectivityManager.BLOCKED_REASON_OEM_DENY;
++import static android.net.ConnectivityManager.BLOCKED_METERED_REASON_USER_RESTRICTED;
++import static android.net.ConnectivityManager.BLOCKED_METERED_REASON_ADMIN_DISABLED;
++import static android.net.ConnectivityManager.BLOCKED_METERED_REASON_DATA_SAVER;
++import static android.system.OsConstants.EPROTO;
++
++import android.os.RemoteException;
++import android.os.Process;
++import android.os.UserHandle;
++import android.os.ServiceSpecificException;
++import com.android.internal.net.TronaUidBlockedStatus;
++import com.android.internal.net.IOemNetd;
++import com.android.internal.net.TronaUidChain;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Map;
++import java.util.Objects;
++import java.util.Set;
++import java.util.TreeMap;
++import java.util.TreeSet;
++
++/**
++ * Device-local nonmetered and metered membership client, staged for Connectivity integration.
++ *
++ * One instance must exclusively own the native UID backend. The creator supplies
++ * the complete active-user set and a selected OEM endpoint; construction performs
++ * full empty-policy replay to both snapshots and propagates any backend error. Construct
++ * only for a fresh startup before policy activation and framework policy
++ * reconstruction, never to attach to an already active policy. No backend
++ * selection, parent hook, BPF bypass, Binder reconnection or Data Saver policy is
++ * provided here. Netd's existing zygote restart contract reconstructs system_server.
++ *
++ * State is published only after acknowledgement. Any transport/service failure may
++ * follow a partial native commit: retain the last acknowledged snapshot and replay
++ * it before another operation, including an otherwise-idempotent call or query.
++ * Both snapshots must ACK before the cache is known; no cross-RPC atomicity is claimed.
++ * The failing call still throws; no error is reported as success.
++ * The caller must translate RemoteException to its framework API error contract.
++ * User snapshots are authoritative lifecycle facts: failed updates remain pending
++ * and must reconcile before later policy work. Removed users lose cached UID
++ * memberships, including when a user ID is reused before acknowledgement.
++ * New membership for an inactive user is rejected; late cleanup is still allowed.
++ * User IDs alone cannot identify delayed writes from an older incarnation after
++ * ID reuse. The lifecycle caller must provide ordering/generation protection.
++ */
++public final class TronaUidPolicy {
++    private final IOemNetd mBackend;
++    // All mutable state and RPCs are serialized by this instance's monitor.
++    private Map<Integer, Set<Integer>> mMembers = new TreeMap<>();
++    private Set<Integer> mUsers;
++    private Set<Integer> mPendingUsers;
++    private final Set<Integer> mRemovedUsers = new TreeSet<>();
++    // Matches Android UID arithmetic and the native dispatch builder.
++    private static final int UIDS_PER_USER = 100_000;
++    private final Set<Integer> mEnabled = new TreeSet<>();
++    private boolean mKnown;
++
++    public TronaUidPolicy(IOemNetd backend, int[] activeUsers) throws RemoteException {
++        mBackend = Objects.requireNonNull(backend);
++        mUsers = checkedUsers(activeUsers);
++        for (int chain : new int[] {FIREWALL_CHAIN_DOZABLE, FIREWALL_CHAIN_STANDBY,
++                FIREWALL_CHAIN_POWERSAVE, FIREWALL_CHAIN_RESTRICTED,
++                FIREWALL_CHAIN_LOW_POWER_STANDBY, FIREWALL_CHAIN_BACKGROUND,
++                FIREWALL_CHAIN_OEM_DENY_1, FIREWALL_CHAIN_OEM_DENY_2,
++                FIREWALL_CHAIN_OEM_DENY_3, FIREWALL_CHAIN_METERED_ALLOW,
++                FIREWALL_CHAIN_METERED_DENY_USER, FIREWALL_CHAIN_METERED_DENY_ADMIN}) {
++            mMembers.put(chain, new TreeSet<>());
++        }
++        replay();
++    }
++
++    private static boolean isAllowChain(int chain) {
++        switch (chain) {
++            case FIREWALL_CHAIN_DOZABLE:
++            case FIREWALL_CHAIN_POWERSAVE:
++            case FIREWALL_CHAIN_RESTRICTED:
++            case FIREWALL_CHAIN_LOW_POWER_STANDBY:
++            case FIREWALL_CHAIN_BACKGROUND:
++                return true;
++            case FIREWALL_CHAIN_STANDBY:
++            case FIREWALL_CHAIN_OEM_DENY_1:
++            case FIREWALL_CHAIN_OEM_DENY_2:
++            case FIREWALL_CHAIN_OEM_DENY_3:
++                return false;
++            case FIREWALL_CHAIN_METERED_ALLOW:
++                return true;
++            case FIREWALL_CHAIN_METERED_DENY_USER:
++            case FIREWALL_CHAIN_METERED_DENY_ADMIN:
++                return false;
++            default:
++                throw new IllegalArgumentException("Invalid firewall chain: " + chain);
++        }
++    }
++
++    private static boolean isMeteredChain(int chain) {
++        return chain == FIREWALL_CHAIN_METERED_ALLOW
++                || chain == FIREWALL_CHAIN_METERED_DENY_USER
++                || chain == FIREWALL_CHAIN_METERED_DENY_ADMIN;
++    }
++
++    private static void checkUid(int uid) {
++        if (uid < 0) throw new IllegalArgumentException("Negative UID: " + uid);
++    }
++
++    private void checkMemberUser(int uid) {
++        Set<Integer> current = mPendingUsers != null ? mPendingUsers : mUsers;
++        if (!current.contains(uid / UIDS_PER_USER)) {
++            throw new IllegalArgumentException("Inactive user for UID: " + uid);
++        }
++    }
++
++    private static Set<Integer> checkedUsers(int[] users) {
++        Set<Integer> result = new TreeSet<>();
++        for (int user : Objects.requireNonNull(users)) {
++            // Same bounded UID-range arithmetic as the native dispatch builder.
++            if (user < 0 || user > 21474) throw new IllegalArgumentException("Invalid user: " + user);
++            result.add(user);
++        }
++        if (!result.contains(0)) throw new IllegalArgumentException("Missing system user");
++        return result;
++    }
++
++    private static int[] array(Set<Integer> values) {
++        return values.stream().mapToInt(Integer::intValue).toArray();
++    }
++
++    private interface Call<T> { T run() throws RemoteException; }
++
++    private <T> T invoke(Call<T> call) throws RemoteException {
++        try {
++            return call.run();
++        } catch (RemoteException | RuntimeException error) {
++            mKnown = false;
++            throw error;
++        }
++    }
++
++    private void restore(Set<Integer> users, Map<Integer, Set<Integer>> members)
++            throws RemoteException {
++        List<TronaUidChain> chains = new ArrayList<>();
++        for (Map.Entry<Integer, Set<Integer>> entry : members.entrySet()) {
++            if (isMeteredChain(entry.getKey())) continue;
++            TronaUidChain chain = new TronaUidChain();
++            chain.chain = entry.getKey();
++            chain.uids = array(entry.getValue());
++            chains.add(chain);
++        }
++        invoke(() -> {
++            mBackend.replaceTronaUidPolicy(array(users), chains.toArray(new TronaUidChain[0]),
++                    array(mEnabled));
++            mBackend.replaceTronaMeteredPolicy(array(users),
++                    array(members.get(FIREWALL_CHAIN_METERED_ALLOW)),
++                    array(members.get(FIREWALL_CHAIN_METERED_DENY_USER)),
++                    array(members.get(FIREWALL_CHAIN_METERED_DENY_ADMIN)));
++            return null;
++        });
++        mKnown = true;
++    }
++
++    /** Reconcile authoritative users first, otherwise the last acknowledged policy. */
++    public synchronized void replay() throws RemoteException {
++        if (mPendingUsers != null) applyPendingUsers();
++        else restore(mUsers, mMembers);
++    }
++
++    private void ensureReplayed() throws RemoteException {
++        if (mPendingUsers != null || !mKnown) replay();
++    }
++
++    private void applyPendingUsers() throws RemoteException {
++        if (mPendingUsers == null) return;
++        Map<Integer, Set<Integer>> retained = new TreeMap<>();
++        for (Map.Entry<Integer, Set<Integer>> entry : mMembers.entrySet()) {
++            Set<Integer> uids = new TreeSet<>();
++            for (int uid : entry.getValue()) {
++                int user = uid / UIDS_PER_USER;
++                if (mPendingUsers.contains(user) && !mRemovedUsers.contains(user)) uids.add(uid);
++            }
++            retained.put(entry.getKey(), uids);
++        }
++        restore(mPendingUsers, retained);
++        mUsers = mPendingUsers;
++        mMembers = retained;
++        mPendingUsers = null;
++        mRemovedUsers.clear();
++    }
++
++    /** Apply the complete current user set; failures block subsequent policy calls until replay. */
++    public synchronized void replaceUsers(int[] activeUsers) throws RemoteException {
++        replaceUsersInternal(activeUsers, null);
++    }
++
++    /** Record removal plus the full current snapshot as one durable pending intent. */
++    public synchronized void replaceUsersAfterRemoval(int[] activeUsers, int removedUser)
++            throws RemoteException {
++        if (removedUser <= 0 || removedUser > 21474) {
++            throw new IllegalArgumentException("Invalid removed user: " + removedUser);
++        }
++        replaceUsersInternal(activeUsers, removedUser);
++    }
++
++    // Called under this instance's monitor. No RPC occurs before both facts are pending.
++    private void replaceUsersInternal(int[] activeUsers, Integer removedUser) throws RemoteException {
++        Set<Integer> candidate = checkedUsers(activeUsers);
++        Set<Integer> previous = mPendingUsers != null ? mPendingUsers : mUsers;
++        for (int user : previous) {
++            if (!candidate.contains(user)) mRemovedUsers.add(user);
++        }
++        // Keep removal history until acknowledgement so remove/re-add cannot revive
++        // old policy when the first restore had an ambiguous result.
++        if (removedUser != null) mRemovedUsers.add(removedUser);
++        mPendingUsers = candidate;
++        applyPendingUsers();
++    }
++
++    public synchronized void replaceUidChain(int chain, int[] uids) throws RemoteException {
++        isAllowChain(chain);
++        Set<Integer> replacement = new TreeSet<>();
++        for (int uid : Objects.requireNonNull(uids)) {
++            checkUid(uid);
++            checkMemberUser(uid);
++            replacement.add(uid);
++        }
++        applyPendingUsers();
++        Map<Integer, Set<Integer>> candidate = new TreeMap<>(mMembers);
++        candidate.put(chain, replacement);
++        restore(mUsers, candidate);
++        mMembers = candidate;
++    }
++
++    public synchronized void setUidRule(int chain, int uid, int rule) throws RemoteException {
++        boolean allowChain = isAllowChain(chain);
++        checkUid(uid);
++        if (rule != FIREWALL_RULE_ALLOW && rule != FIREWALL_RULE_DENY) {
++            throw new IllegalArgumentException("Invalid rule: " + rule);
++        }
++        boolean member = allowChain == (rule == FIREWALL_RULE_ALLOW);
++        if (member) checkMemberUser(uid);
++        ensureReplayed();
++        Set<Integer> members = mMembers.get(chain);
++        if (members.contains(uid) == member) return;
++        invoke(() -> {
++            if (isMeteredChain(chain)) mBackend.setTronaMeteredUidRule(chain, uid, rule);
++            else mBackend.setTronaUidRule(chain, uid, rule);
++            return null;
++        });
++        if (member) members.add(uid); else members.remove(uid);
++    }
++
++    public synchronized int getUidRule(int chain, int uid) throws RemoteException {
++        isAllowChain(chain);
++        checkUid(uid);
++        ensureReplayed();
++        return invoke(() -> isMeteredChain(chain)
++                ? mBackend.getTronaMeteredUidRule(chain, uid)
++                : mBackend.getTronaUidRule(chain, uid));
++    }
++
++    public synchronized void setChildChain(int chain, boolean enabled) throws RemoteException {
++        isAllowChain(chain);
++        if (isMeteredChain(chain)) {
++            throw new UnsupportedOperationException("Metered chain has no child enable state: " + chain);
++        }
++        ensureReplayed();
++        if (mEnabled.contains(chain) == enabled) return;
++        invoke(() -> { mBackend.setTronaChildChain(chain, enabled); return null; });
++        if (enabled) mEnabled.add(chain); else mEnabled.remove(chain);
++    }
++
++    public synchronized boolean isChainEnabled(int chain) throws RemoteException {
++        isAllowChain(chain);
++        if (isMeteredChain(chain)) {
++            throw new UnsupportedOperationException("Metered chain has no child enable state: " + chain);
++        }
++        ensureReplayed();
++        return invoke(() -> mBackend.isTronaChildChainEnabled(chain));
++    }
++
++    private static Set<Integer> checkedSnapshotChains(int[] chains, boolean enabled) {
++        if (chains == null) throw new ServiceSpecificException(EPROTO, "Missing chain array");
++        Set<Integer> result = new TreeSet<>();
++        for (int chain : chains) {
++            try {
++                isAllowChain(chain);
++            } catch (IllegalArgumentException error) {
++                throw new ServiceSpecificException(EPROTO, "Invalid snapshot chain: " + chain);
++            }
++            if ((enabled && isMeteredChain(chain)) || !result.add(chain)) {
++                throw new ServiceSpecificException(EPROTO, "Invalid/duplicate snapshot chain: " + chain);
++            }
++        }
++        return result;
++    }
++
++    /** Actual native ACK-known status, serialized with this owner's mutations/replay. */
++    public synchronized int getUidNetworkingBlockedReasons(int uid) throws RemoteException {
++        checkUid(uid);
++        // Preserve the platform's unconditional exemption before any policy read/replay.
++        if (UserHandle.getAppId(uid) < Process.FIRST_APPLICATION_UID) return BLOCKED_REASON_NONE;
++        ensureReplayed();
++        return invoke(() -> {
++            final TronaUidBlockedStatus status = mBackend.getTronaUidBlockedStatus(uid);
++            if (status == null) throw new ServiceSpecificException(EPROTO, "Missing blocked status");
++            final Set<Integer> enabled = checkedSnapshotChains(status.enabledChains, true);
++            final Set<Integer> denied = checkedSnapshotChains(status.deniedChains, false);
++            int reasons = BLOCKED_REASON_NONE;
++            for (int chain : enabled) {
++                if (!denied.contains(chain)) continue;
++                switch (chain) {
++                    case FIREWALL_CHAIN_POWERSAVE: reasons |= BLOCKED_REASON_BATTERY_SAVER; break;
++                    case FIREWALL_CHAIN_DOZABLE: reasons |= BLOCKED_REASON_DOZE; break;
++                    case FIREWALL_CHAIN_STANDBY: reasons |= BLOCKED_REASON_APP_STANDBY; break;
++                    case FIREWALL_CHAIN_RESTRICTED: reasons |= BLOCKED_REASON_RESTRICTED_MODE; break;
++                    case FIREWALL_CHAIN_LOW_POWER_STANDBY: reasons |= BLOCKED_REASON_LOW_POWER_STANDBY; break;
++                    case FIREWALL_CHAIN_BACKGROUND: reasons |= BLOCKED_REASON_APP_BACKGROUND; break;
++                    case FIREWALL_CHAIN_OEM_DENY_1:
++                    case FIREWALL_CHAIN_OEM_DENY_2:
++                    case FIREWALL_CHAIN_OEM_DENY_3: reasons |= BLOCKED_REASON_OEM_DENY; break;
++                    default: throw new ServiceSpecificException(EPROTO, "Invalid enabled chain");
++                }
++            }
++            if (denied.contains(FIREWALL_CHAIN_METERED_DENY_USER)) {
++                reasons |= BLOCKED_METERED_REASON_USER_RESTRICTED;
++            }
++            if (denied.contains(FIREWALL_CHAIN_METERED_DENY_ADMIN)) {
++                reasons |= BLOCKED_METERED_REASON_ADMIN_DISABLED;
++            }
++            if (denied.contains(FIREWALL_CHAIN_METERED_ALLOW) && status.dataSaverEnabled) {
++                reasons |= BLOCKED_METERED_REASON_DATA_SAVER;
++            }
++            return reasons;
++        });
++    }
++
++    /** Membership only; the caller distinguishes allow-list and deny-list chains. */
++    public synchronized Set<Integer> getUidsOnChain(int chain) throws RemoteException {
++        isAllowChain(chain);
++        ensureReplayed();
++        return Set.copyOf(mMembers.get(chain));
++    }
++}
+diff --git a/tests/unit/java/com/android/server/connectivity/ClatCoordinatorTest.java b/tests/unit/java/com/android/server/connectivity/ClatCoordinatorTest.java
+index db3ce36..e6f1ee1 100644
+--- a/tests/unit/java/com/android/server/connectivity/ClatCoordinatorTest.java
++++ b/tests/unit/java/com/android/server/connectivity/ClatCoordinatorTest.java
+@@ -151,6 +151,11 @@ public class ClatCoordinatorTest {
+       * be overridden to avoid calling native methods.
+       */
+     protected class TestDependencies extends ClatCoordinator.Dependencies {
++        @Override
++        public boolean isClatSupported() {
++            return true;
++        }
++
+         /**
+           * Get netd.
+           */
+diff --git a/tests/unit/java/com/android/server/connectivity/Nat464XlatTest.java b/tests/unit/java/com/android/server/connectivity/Nat464XlatTest.java
+index 2fe8713..a39791a 100644
+--- a/tests/unit/java/com/android/server/connectivity/Nat464XlatTest.java
++++ b/tests/unit/java/com/android/server/connectivity/Nat464XlatTest.java
+@@ -125,6 +125,7 @@ public class Nat464XlatTest {
+     @Before
+     public void setUp() throws Exception {
+         MockitoAnnotations.initMocks(this);
++        doReturn(true).when(mClatCoordinator).isClatSupported();
+ 
+         mNai.linkProperties = new LinkProperties();
+         mNai.linkProperties.setInterfaceName(BASE_IFACE);

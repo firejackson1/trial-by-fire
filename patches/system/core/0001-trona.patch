@@ -1,0 +1,1954 @@
+diff --git a/init/Android.bp b/init/Android.bp
+index 703542f..e52303f 100644
+--- a/init/Android.bp
++++ b/init/Android.bp
+@@ -135,7 +135,13 @@ libinit_cc_defaults {
+         "-Wextra",
+         "-Wno-unused-parameter",
+         "-Wthread-safety",
+-    ],
++    ] + select(soong_config_variable("trona_compat", "init_fatal_recovery"), {
++        true: ["-DTRONA_INIT_FATAL_RECOVERY"],
++        default: [],
++    }) + select(soong_config_variable("trona_compat", "early_boot_recorder"), {
++        true: ["-DTRONA_EARLY_RECORDER"],
++        default: [],
++    }),
+     product_variables: {
+         debuggable: {
+             cppflags: [
+@@ -237,7 +243,12 @@ cc_defaults {
+         "init_defaults",
+         "selinux_policy_version",
+     ],
+-    srcs: init_common_sources + init_device_sources,
++    srcs: init_common_sources + init_device_sources + select(
++        soong_config_variable("trona_compat", "early_boot_recorder"), {
++            true: ["trona_boot_recorder/recorder_core.cpp",
++                   "trona_boot_recorder/recorder_worker.cpp"],
++            default: [],
++        }),
+     export_include_dirs: ["."],
+     generated_sources: [
+         "apex-info-list",
+diff --git a/init/action.cpp b/init/action.cpp
+index 18f6360..777947f 100644
+--- a/init/action.cpp
++++ b/init/action.cpp
+@@ -13,6 +13,10 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
++#include "trona_boot_recorder/recorder_scope.h"
++#if TRONA_EARLY_RECORDER_ENABLED
++#include "trona_boot_recorder/recorder_worker.h"
++#endif
+ 
+ #include "action.h"
+ 
+@@ -158,7 +162,17 @@ void Action::ExecuteAllCommands() const {
+ 
+ void Action::ExecuteCommand(const Command& command) const {
+     android::base::Timer t;
++#if TRONA_EARLY_RECORDER_ENABLED
++    const auto recorder_code = command.RecorderCode();
++    if (recorder_code) trona_recorder::Mark(100 + recorder_code, 0, 0,
++            trona_recorder::SourceId(filename_.c_str()), command.line());
++#endif
+     auto result = command.InvokeFunc(subcontext_);
++#if TRONA_EARLY_RECORDER_ENABLED
++    if (recorder_code) trona_recorder::Mark((result.ok() ? 200 : 250) + recorder_code,
++            0, result.ok() ? 0 : static_cast<int>(result.error().code()),
++            trona_recorder::SourceId(filename_.c_str()), command.line());
++#endif
+     auto duration = t.duration();
+ 
+     // Any action longer than 50ms will be warned to user as slow operation
+diff --git a/init/action.h b/init/action.h
+index eddc384..70b8f8b 100644
+--- a/init/action.h
++++ b/init/action.h
+@@ -15,7 +15,7 @@
+  */
+ 
+ #pragma once
+-
++#include "trona_boot_recorder/recorder_scope.h"
+ #include <map>
+ #include <queue>
+ #include <string>
+@@ -45,6 +45,18 @@ class Command {
+     Result<void> CheckCommand() const;
+ 
+     int line() const { return line_; }
++#if TRONA_EARLY_RECORDER_ENABLED
++    unsigned RecorderCode() const {
++        if (args_.empty()) return 0;
++        const auto& name = args_[0];
++        if (name == "exec_start") return 1;
++        if (name == "perform_apex_config") return 2;
++        if (name == "wait_for_prop") return 3;
++        if (name == "mount_all") return 4;
++        if (name == "exec") return 5;
++        return 0;
++    }
++#endif
+ 
+   private:
+     BuiltinFunction func_;
+diff --git a/init/init.cpp b/init/init.cpp
+index aec2688..809c34f 100644
+--- a/init/init.cpp
++++ b/init/init.cpp
+@@ -13,6 +13,10 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
++#include "trona_boot_recorder/recorder_scope.h"
++#if TRONA_EARLY_RECORDER_ENABLED
++#include "trona_boot_recorder/recorder_worker.h"
++#endif
+ 
+ #include "init.h"
+ 
+@@ -1078,6 +1082,10 @@ int SecondStageMain(int argc, char** argv) {
+ 
+     SetStdioToDevNull(argv);
+     InitKernelLogging(argv);
++#if TRONA_EARLY_RECORDER_ENABLED
++    trona_recorder::Start();
++    trona_recorder::Mark(1);
++#endif
+     LOG(INFO) << "init second stage started!";
+ 
+     SelinuxSetupKernelLogging();
+@@ -1123,7 +1131,13 @@ int SecondStageMain(int argc, char** argv) {
+         UmountDebugRamdisk();
+     }
+ 
++#if TRONA_EARLY_RECORDER_ENABLED
++    trona_recorder::Mark(2);
++#endif
+     PropertyInit();
++#if TRONA_EARLY_RECORDER_ENABLED
++    trona_recorder::Mark(3);
++#endif
+ 
+     // Umount second stage resources after property service has read the .prop files.
+     UmountSecondStageRes();
+@@ -1137,8 +1151,14 @@ int SecondStageMain(int argc, char** argv) {
+     MountExtraFilesystems();
+ 
+     // Now set up SELinux for second stage.
++#if TRONA_EARLY_RECORDER_ENABLED
++    trona_recorder::Mark(4);
++#endif
+     SelabelInitialize();
+     SelinuxRestoreContext();
++#if TRONA_EARLY_RECORDER_ENABLED
++    trona_recorder::Mark(5);
++#endif
+ 
+     Epoll epoll;
+     if (auto result = epoll.Open(); !result.ok()) {
+@@ -1195,9 +1215,15 @@ int SecondStageMain(int argc, char** argv) {
+     const BuiltinFunctionMap& function_map = GetBuiltinFunctionMap();
+     Action::set_function_map(&function_map);
+ 
++#if TRONA_EARLY_RECORDER_ENABLED
++    trona_recorder::Mark(6);
++#endif
+     if (!SetupMountNamespaces()) {
+         PLOG(FATAL) << "SetupMountNamespaces failed";
+     }
++#if TRONA_EARLY_RECORDER_ENABLED
++    trona_recorder::Mark(7);
++#endif
+ 
+     InitializeSubcontext();
+ 
+@@ -1205,7 +1231,13 @@ int SecondStageMain(int argc, char** argv) {
+     am.EnableInitEventTimestamp(com::android::init::flags::enable_init_event_timestamp());
+     ServiceList& sm = ServiceList::GetInstance();
+ 
++#if TRONA_EARLY_RECORDER_ENABLED
++    trona_recorder::Mark(8);
++#endif
+     LoadBootScripts(am, sm);
++#if TRONA_EARLY_RECORDER_ENABLED
++    trona_recorder::Mark(9);
++#endif
+ 
+     // Turning this on and letting the INFO logging be discarded adds 0.2s to
+     // Nexus 9 boot time, so it's disabled by default.
+diff --git a/init/property_service.h b/init/property_service.h
+index 71a609c..d98d107 100644
+--- a/init/property_service.h
++++ b/init/property_service.h
+@@ -19,6 +19,7 @@
+ #include <sys/socket.h>
+ 
+ #include <condition_variable>
++#include <cstdint>
+ #include <deque>
+ #include <mutex>
+ #include <string>
+@@ -33,6 +34,9 @@ static constexpr const char kRestoreconProperty[] = "selinux.restorecon_recursiv
+ 
+ bool CanReadProperty(const std::string& source_context, const std::string& name);
+ 
++// Synchronous internal setter: init callers must check PROP_SUCCESS (zero).
++uint32_t InitPropertySet(const std::string& name, const std::string& value);
++
+ void PropertyInit();
+ void StartPropertyService(int* epoll_socket);
+ 
+diff --git a/init/reboot_utils.cpp b/init/reboot_utils.cpp
+index 5c402fe..d2a3b5e 100644
+--- a/init/reboot_utils.cpp
++++ b/init/reboot_utils.cpp
+@@ -38,7 +38,12 @@
+ namespace android {
+ namespace init {
+ 
++#if defined(TRONA_INIT_FATAL_RECOVERY)
++// Dedicated retained-boot development product; explicit boot settings still win.
++[[clang::no_destroy]] static std::string init_fatal_reboot_target = "recovery";
++#else
+ [[clang::no_destroy]] static std::string init_fatal_reboot_target = "bootloader";
++#endif
+ static bool init_fatal_panic = false;
+ 
+ // this needs to read the /proc/* files directly because it is called before
+@@ -67,10 +72,10 @@ void SetFatalRebootTarget(const std::optional<std::string>& reboot_target) {
+     auto start_pos = cmdline.find(kRebootTargetString);
+     if (start_pos == std::string::npos) {
+         android::fs_mgr::GetBootconfig(kRebootTargetString, &init_fatal_reboot_target);
+-        // We already default to bootloader if no setting is provided.
++        // Keep the build default if no setting is provided.
+     } else {
+         const std::string kRebootTargetStringPattern = kRebootTargetString + "=";
+-        start_pos += sizeof(kRebootTargetStringPattern) - 1;
++        start_pos += kRebootTargetStringPattern.size();
+ 
+         auto end_pos = cmdline.find(' ', start_pos);
+         // if end_pos isn't found, then we've run off the end, but this is okay as this is the last
+@@ -179,7 +184,7 @@ void __attribute__((noreturn)) InitFatalReboot(int signal_number) {
+ 
+ void InstallRebootSignalHandlers() {
+     // Instead of panic'ing the kernel as is the default behavior when init crashes,
+-    // we prefer to reboot to bootloader on development builds, as this will prevent
++    // we prefer to reboot to the configured target on development builds, to prevent
+     // boot looping bad configurations and allow both developers and test farms to easily
+     // recover.
+     struct sigaction action;
+diff --git a/init/service.cpp b/init/service.cpp
+old mode 100644
+new mode 100755
+index e761285..2486d35
+--- a/init/service.cpp
++++ b/init/service.cpp
+@@ -13,6 +13,11 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
++#include "trona_boot_recorder/recorder_scope.h"
++#if TRONA_EARLY_RECORDER_ENABLED
++#include "trona_boot_recorder/recorder_worker.h"
++#include "trona_boot_recorder/service_events.h"
++#endif
+ 
+ #include "service.h"
+ 
+@@ -57,7 +62,10 @@
+ #ifdef INIT_FULL_SOURCES
+ #include <android/api-level.h>
+ 
++#include <sys/system_properties.h>
++
+ #include "mount_namespace.h"
++#include "property_service.h"
+ #include "reboot_utils.h"
+ #include "selinux.h"
+ #else
+@@ -192,6 +200,41 @@ Service::Service(const std::string& name, unsigned flags, std::optional<uid_t> u
+       args_(args),
+       filename_(filename) {}
+ 
++// BEGIN retained netd lifecycle fence
++// This only fences the existing explicit legacy netd lifecycle. Native profile
++// validation and readiness publication remain in netd, not in init.
++static uint64_t trona_netd_generation_counter = 0;
++static bool IsTronaLegacyNetd(const std::string& service_name) {
++    return service_name == "netd" && GetProperty("ro.trona.network_backend", "") == "legacy";
++}
++static bool SetTronaNetdLifecycleProperty(const std::string& name, const std::string& value) {
++#if INIT_FULL_SOURCES
++    if (InitPropertySet(name, value) == PROP_SUCCESS) return true;
++#else
++    // Host libinit has no property service; retain its existing property boundary.
++    if (SetProperty(name, value)) return true;
++#endif
++    LOG(ERROR) << "Cannot update selected legacy netd lifecycle property " << name;
++    return false;
++}
++static bool ResetTronaNetdReadiness(const std::string& service_name) {
++    if (!IsTronaLegacyNetd(service_name)) return true;
++    // Invalidate the init-owned generation FIRST: any delayed old ready write
++    // remains unusable even if its property request commits after this reset.
++    return SetTronaNetdLifecycleProperty("sys.trona.netd_generation", "0") &&
++           SetTronaNetdLifecycleProperty("sys.trona.netd_ready", "0");
++}
++static bool PrepareTronaNetdGeneration(const std::string& service_name) {
++    if (!IsTronaLegacyNetd(service_name)) return true;
++    if (!ResetTronaNetdReadiness(service_name)) return false;
++    // Service lifecycle runs on init's main thread. Consume every attempt's
++    // nonce, including failed forks; never reuse an earlier daemon's generation.
++    if (trona_netd_generation_counter == UINT64_MAX) return false;
++    return SetTronaNetdLifecycleProperty("sys.trona.netd_generation",
++                                        std::to_string(++trona_netd_generation_counter));
++}
++// END retained netd lifecycle fence
++
+ void Service::NotifyStateChange(const std::string& new_state) const {
+     if ((flags_ & SVC_TEMPORARY) != 0) {
+         // Services created by 'exec' are temporary and don't have properties tracking their state.
+@@ -280,7 +323,69 @@ void Service::SetProcessAttributesAndCaps(InterprocessFifo setsid_finished) {
+     }
+ }
+ 
++#if TRONA_EARLY_RECORDER_ENABLED
++namespace {
++trona_recorder::DefaultServiceEventBudget trona_service_budget;
++// Budgeted service-lifecycle record. Mark() preserves errno and never blocks.
++void TronaServiceMark(uint16_t event, uint32_t detail, int32_t status, uint32_t id,
++                      uint32_t pid, bool priority) {
++    const uint16_t limit = trona_recorder::ServiceLimit(priority);
++    switch (trona_service_budget.Admit(id, limit)) {
++        case trona_recorder::Admission::kRecord:
++            trona_recorder::Mark(event, detail, status, id, pid);
++            break;
++        case trona_recorder::Admission::kSuppressNow:
++            trona_recorder::Mark(trona_recorder::kServiceEventsSuppressed, limit, event, id, pid);
++            break;
++        case trona_recorder::Admission::kTableFullNow:
++            trona_recorder::Mark(trona_recorder::kServiceBudgetTableFull,
++                                 static_cast<uint32_t>(trona_recorder::kBudgetSlots), event, id, pid);
++            break;
++        case trona_recorder::Admission::kDrop:
++            break;
++    }
++}
++// Crash counts up to init's fatal threshold always reach Mark(): only the global
++// record cap applies, so the fifth (fatal) count cannot be budgeted away.
++void TronaCrashMark(uint32_t count, int32_t status, uint32_t id, uint32_t pid, bool priority) {
++    if (count <= trona_recorder::kCrashCountAlwaysRecorded)
++        trona_recorder::Mark(trona_recorder::kServiceCrashCount, count, status, id, pid);
++    else
++        TronaServiceMark(trona_recorder::kServiceCrashCount, count, status, id, pid, priority);
++}
++}  // namespace
++#endif
++
+ void Service::Reap(const siginfo_t& siginfo) {
++#if TRONA_EARLY_RECORDER_ENABLED
++    // Reap() clears pid_ before the crash-count hooks: keep the reaped PID for them.
++    const uint32_t trona_reaped_pid = static_cast<uint32_t>(pid_);
++    const uint32_t trona_id = trona_recorder::SourceId(name_.c_str());
++    const bool trona_priority = trona_recorder::IsPriorityService(name_);
++#endif
++#if TRONA_EARLY_RECORDER_ENABLED
++    if (flags_ & SVC_EXEC) trona_recorder::Mark(450, siginfo.si_code,
++            siginfo.si_status, trona_recorder::SourceId(name_.c_str()),
++            static_cast<uint32_t>(pid_));
++#endif
++#if TRONA_EARLY_RECORDER_ENABLED
++    const unsigned recorder_service = name_ == "apexd-bootstrap" ? 1 :
++            name_ == "apexd" ? 2 : name_ == "netd" ? 3 :
++            name_ == "netd1shot" ? 4 : 0;
++    if (recorder_service) trona_recorder::Mark(400 + recorder_service,
++            siginfo.si_code, siginfo.si_status, trona_recorder::SourceId(name_.c_str()), static_cast<uint32_t>(pid_));
++    // Every other reap. 450 (SVC_EXEC) and 401-404 already cover the rest, unchanged.
++    if (!(flags_ & SVC_EXEC) && !recorder_service)
++        TronaServiceMark(trona_recorder::kServiceReap, siginfo.si_code, siginfo.si_status,
++                         trona_id, trona_reaped_pid, trona_priority);
++#endif
++    if (!ResetTronaNetdReadiness(name_)) {
++        // Void lifecycle APIs cannot return a property error. Stop progression
++        // before any new generation/Java restart and request controlled shutdown.
++        trigger_shutdown("reboot,trona-netd-ready-reset-fail");
++        return;
++    }
++
+     if (!(flags_ & SVC_ONESHOT) || (flags_ & SVC_RESTART)) {
+         KillProcessGroup(SIGKILL);
+     } else {
+@@ -385,7 +490,14 @@ void Service::Reap(const siginfo_t& siginfo) {
+         !was_last_exit_ok_) {
+         bool boot_completed = GetBoolProperty("sys.boot_completed", false);
+         if (now < time_crashed_ + fatal_crash_window_ || !boot_completed) {
+-            if (++crash_count_ > 4) {
++            ++crash_count_;
++#if TRONA_EARLY_RECORDER_ENABLED
++            // Recorded before any LOG(FATAL) below; delivery after abort is best-effort.
++            TronaCrashMark(static_cast<uint32_t>(crash_count_),
++                           (flags_ & SVC_CRITICAL) ? trona_recorder::kCrashCritical : 0,
++                           trona_id, trona_reaped_pid, trona_priority);
++#endif
++            if (crash_count_ > 4) {
+                 auto exit_reason =
+                         boot_completed
+                                 ? "in " + std::to_string(fatal_crash_window_.count()) + " minutes"
+@@ -419,6 +531,12 @@ void Service::Reap(const siginfo_t& siginfo) {
+         } else {
+             time_crashed_ = now;
+             crash_count_ = 1;
++#if TRONA_EARLY_RECORDER_ENABLED
++            TronaCrashMark(1u,
++                           trona_recorder::kCrashWindowReset |
++                                   ((flags_ & SVC_CRITICAL) ? trona_recorder::kCrashCritical : 0),
++                           trona_id, trona_reaped_pid, trona_priority);
++#endif
+         }
+     }
+ 
+@@ -467,6 +585,11 @@ Result<void> Service::ExecStart() {
+ 
+     flags_ |= SVC_EXEC;
+     is_exec_service_running_ = true;
++#if TRONA_EARLY_RECORDER_ENABLED
++    // Actual child start, not completion of an exec/exec_start builtin.
++    trona_recorder::Mark(350, 0, 0, trona_recorder::SourceId(name_.c_str()),
++            static_cast<uint32_t>(pid_));
++#endif
+ 
+     LOG(INFO) << "SVC_EXEC service '" << name_ << "' pid " << pid_ << " (uid " << uid() << " gid "
+               << proc_attr_.gid << "+" << proc_attr_.supp_gids.size() << " context "
+@@ -606,7 +729,39 @@ void Service::RunService(const std::vector<Descriptor>& descriptors,
+     }
+ }
+ 
++#if TRONA_EARLY_RECORDER_ENABLED
++// Records the outcome of every Start() call, including each early return, without
++// touching the body. The Result is returned unchanged; Mark() preserves errno.
+ Result<void> Service::Start() {
++    const uint32_t id = trona_recorder::SourceId(name_.c_str());
++    const bool priority = trona_recorder::IsPriorityService(name_);
++    if (priority)
++        TronaServiceMark(trona_recorder::kServiceStartEnter, flags_, 0, id,
++                         static_cast<uint32_t>(pid_), true);
++    const bool running_before = flags_ & SVC_RUNNING;
++    const auto order_before = start_order_;
++    auto result = StartImpl();
++    const int code = result.ok() ? 0 : static_cast<int>(result.error().code());
++    TronaServiceMark(trona_recorder::kServiceStartResult,
++                     trona_recorder::StartDetail(start_order_ != order_before, running_before,
++                                                 flags_ & SVC_RUNNING, flags_ & SVC_DISABLED,
++                                                 !result.ok(), code),
++                     trona_recorder::StartStatus(!result.ok(), code), id,
++                     static_cast<uint32_t>(pid_), priority);
++    return result;
++}
++
++Result<void> Service::StartImpl() {
++#else
++Result<void> Service::Start() {
++#endif
++#if TRONA_EARLY_RECORDER_ENABLED
++    const unsigned recorder_service = name_ == "apexd-bootstrap" ? 1 :
++            name_ == "apexd" ? 2 : name_ == "netd" ? 3 :
++            name_ == "netd1shot" ? 4 : 0;
++    if (recorder_service) trona_recorder::Mark(300 + recorder_service,
++            0, 0, trona_recorder::SourceId(name_.c_str()), static_cast<uint32_t>(pid_));
++#endif
+     auto reboot_on_failure = make_scope_guard([this] {
+         if (on_failure_reboot_target_) {
+             trigger_shutdown(*on_failure_reboot_target_);
+@@ -645,6 +800,12 @@ Result<void> Service::Start() {
+         return {};
+     }
+ 
++    // Fence before the new child can run, including a manual stop/start. Do not
++    // reset after fork/NotifyStateChange("running"): that could clear new readiness.
++    if (!PrepareTronaNetdGeneration(name_)) {
++        return Error() << "Cannot start legacy netd without resetting native readiness";
++    }
++
+     // cgroups_activated is used for communication from the parent to the child
+     // while setsid_finished is used for communication from the child process to
+     // the parent process. These two communication channels are separate because
+@@ -953,6 +1114,13 @@ void Service::Stop() {
+ }
+ 
+ void Service::Terminate() {
++    if (!ResetTronaNetdReadiness(name_)) {
++        // Void lifecycle APIs cannot return a property error. Stop progression
++        // before any new generation/Java restart and request controlled shutdown.
++        trigger_shutdown("reboot,trona-netd-ready-reset-fail");
++        return;
++    }
++
+     flags_ &= ~(SVC_RESTARTING | SVC_DISABLED_START);
+     flags_ |= SVC_DISABLED;
+     if (pid_) {
+@@ -962,6 +1130,13 @@ void Service::Terminate() {
+ }
+ 
+ void Service::Timeout() {
++    if (!ResetTronaNetdReadiness(name_)) {
++        // Void lifecycle APIs cannot return a property error. Stop progression
++        // before any new generation/Java restart and request controlled shutdown.
++        trigger_shutdown("reboot,trona-netd-ready-reset-fail");
++        return;
++    }
++
+     // All process state flags will be taken care of in Reap(), we really just want to kill the
+     // process here when it times out.  Oneshot processes will transition to be disabled, and
+     // all other processes will transition to be restarting.
+@@ -987,6 +1162,13 @@ void Service::Restart() {
+ 
+ // The how field should be either SVC_DISABLED, SVC_RESET, or SVC_RESTART.
+ void Service::StopOrReset(int how) {
++    if (!ResetTronaNetdReadiness(name_)) {
++        // Void lifecycle APIs cannot return a property error. Stop progression
++        // before any new generation/Java restart and request controlled shutdown.
++        trigger_shutdown("reboot,trona-netd-ready-reset-fail");
++        return;
++    }
++
+     // The service is still SVC_RUNNING until its process exits, but if it has
+     // already exited it shoudn't attempt a restart yet.
+     flags_ &= ~(SVC_RESTARTING | SVC_DISABLED_START);
+diff --git a/init/service.h b/init/service.h
+old mode 100644
+new mode 100755
+index 0095c82..1e8c734
+--- a/init/service.h
++++ b/init/service.h
+@@ -161,6 +161,9 @@ class Service {
+     static void OpenAndSaveStaticKallsymsFd();
+ 
+   private:
++    // Trona recorder builds only: Start() records the outcome, StartImpl() is the
++    // unchanged body. Declared unconditionally so the class layout never varies.
++    Result<void> StartImpl();
+     void NotifyStateChange(const std::string& new_state) const;
+     void StopOrReset(int how);
+     void KillProcessGroup(int signal);
+diff --git a/init/trona_boot_recorder/recorder_core.cpp b/init/trona_boot_recorder/recorder_core.cpp
+new file mode 100644
+index 0000000..af9230d
+--- /dev/null
++++ b/init/trona_boot_recorder/recorder_core.cpp
+@@ -0,0 +1,401 @@
++#include "recorder_core.h"
++#include <cerrno>
++#include <charconv>
++#include <cstring>
++#include <dirent.h>
++#include <fcntl.h>
++#include <sstream>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <vector>
++namespace trona_recorder {
++namespace {
++uint32_t Get32(const unsigned char *p) {
++  return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) |
++         (uint32_t(p[3]) << 24);
++}
++void Put32(unsigned char *p, uint32_t v) {
++  for (int i = 0; i < 4; ++i)
++    p[i] = static_cast<unsigned char>(v >> (8 * i));
++}
++void Put64(unsigned char *p, uint64_t v) {
++  for (int i = 0; i < 8; ++i)
++    p[i] = static_cast<unsigned char>(v >> (8 * i));
++}
++uint32_t Crc(const void *v, size_t n) {
++  auto p = static_cast<const unsigned char *>(v);
++  uint32_t c = ~0u;
++  for (size_t i = 0; i < n; ++i) {
++    c ^= p[i];
++    for (int b = 0; b < 8; ++b)
++      c = (c >> 1) ^ ((c & 1) ? 0xedb88320u : 0);
++  }
++  return ~c;
++}
++int WriteBounded(int fd, const void *p, size_t n, WriteFn writer) {
++  auto b = static_cast<const unsigned char *>(p);
++  for (int i = 0; i < 8 && n; ++i) {
++    ssize_t k = writer(fd, b, n);
++    if (k < 0)
++      return -errno;
++    if (k == 0 || size_t(k) > n)
++      return -EIO;
++    b += k;
++    n -= k;
++  }
++  return n ? -EIO : 0;
++}
++bool Option(const std::string &value, const std::string &token) {
++  std::istringstream in(value);
++  std::string s;
++  while (std::getline(in, s, ','))
++    if (s == token)
++      return true;
++  return false;
++}
++bool Number(const std::string &s, unsigned *n) {
++  auto r = std::from_chars(s.data(), s.data() + s.size(), *n);
++  return !s.empty() && r.ec == std::errc{} && r.ptr == s.data() + s.size();
++}
++int CheckFile(int fd) {
++  struct stat st{};
++  if (fstat(fd, &st))
++    return -errno;
++  if (!S_ISREG(st.st_mode) || st.st_uid != getuid() || st.st_gid != getgid() ||
++      st.st_nlink != 1 || (st.st_mode & 07777) != 0600 || st.st_size < 128)
++    return -EPERM;
++  if (st.st_size > off_t(kMaxJournalBytes))
++    return -EFBIG;
++  return 0;
++}
++} // namespace
++bool ValidBootId(const std::string &id) {
++  if (id.size() != 36)
++    return false;
++  bool nonzero = false;
++  for (size_t i = 0; i < id.size(); ++i) {
++    if (i == 8 || i == 13 || i == 18 || i == 23) {
++      if (id[i] != '-')
++        return false;
++    } else {
++      char c = id[i];
++      if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
++        return false;
++      nonzero |= c != '0';
++    }
++  }
++  return nonzero;
++}
++Record MakeRecord(uint32_t seq, uint32_t lost, uint16_t event, uint64_t ns,
++                  uint32_t detail, int32_t status, uint32_t source,
++                  uint32_t line) {
++  Record r{};
++  if (!seq || !event)
++    return r;
++  memcpy(r.data(), "TRR1", 4);
++  Put32(r.data() + 4, seq);
++  Put32(r.data() + 8, lost);
++  Put32(r.data() + 12, event);
++  Put64(r.data() + 16, ns);
++  Put32(r.data() + 24, detail);
++  Put32(r.data() + 28, static_cast<uint32_t>(status));
++  Put32(r.data() + 32, source);
++  Put32(r.data() + 36, line);
++  Put32(r.data() + 124, Crc(r.data(), 124));
++  return r;
++}
++bool ValidRecord(const Record &r) {
++  return !memcmp(r.data(), "TRR1", 4) && Get32(r.data() + 4) != 0 &&
++         Get32(r.data() + 12) > 0 && Get32(r.data() + 12) <= 65535 &&
++         Get32(r.data() + 124) == Crc(r.data(), 124);
++}
++uint32_t RecordSequence(const Record &r) { return Get32(r.data() + 4); }
++int SendRecord(int fd, const Record &r) {
++  int saved = errno;
++  int result;
++  if (!ValidRecord(r))
++    result = -EINVAL;
++  else {
++    ssize_t n = send(fd, r.data(), r.size(), MSG_DONTWAIT | MSG_NOSIGNAL);
++    result = n < 0 ? -errno : n == ssize_t(r.size()) ? 0 : -EIO;
++  }
++  errno = saved;
++  return result;
++}
++bool MatchMount(const std::string &text, const std::string &target,
++                unsigned maj, unsigned min) {
++  if (text.empty() || text.size() > 65536 || text.back() != '\n' ||
++      target != "/cache")
++    return false;
++  std::istringstream lines(text);
++  std::string line;
++  unsigned matches = 0;
++  bool valid = false;
++  while (std::getline(lines, line)) {
++    if (line.size() > 2048)
++      return false;
++    std::istringstream input(line);
++    std::vector<std::string> t;
++    for (std::string word; input >> word;) {
++      if (t.size() >= 64)
++        return false;
++      t.push_back(word);
++    }
++    if (t.size() < 10)
++      return false;
++    if (t[4] != target)
++      continue;
++    ++matches;
++    size_t sep = 6;
++    while (sep < t.size() && t[sep] != "-")
++      ++sep;
++    if (sep + 3 >= t.size())
++      return false;
++    auto colon = t[2].find(':');
++    unsigned a = 0, b = 0;
++    if (colon == std::string::npos || !Number(t[2].substr(0, colon), &a) ||
++        !Number(t[2].substr(colon + 1), &b))
++      return false;
++    valid = t[3] == "/" && t[sep + 1] == "ext4" && Option(t[5], "rw") &&
++            !Option(t[5], "ro") && Option(t[sep + 3], "rw") &&
++            !Option(t[sep + 3], "ro") && a == maj && b == min;
++  }
++  return matches == 1 && valid;
++}
++int OpenJournal(int parent, const std::string &boot, const std::string &build,
++                uid_t uid, gid_t gid) {
++  if (!ValidBootId(boot) || build.empty() || build.size() > 63 ||
++      build.find('\0') != std::string::npos)
++    return -EINVAL;
++  struct stat ds{};
++  if (fstat(parent, &ds))
++    return -errno;
++  if (!S_ISDIR(ds.st_mode) || (ds.st_mode & 07777) != 0700 ||
++      ds.st_uid != uid || ds.st_gid != gid)
++    return -EPERM;
++  // A dup shares directory offsets: each validation needs a fresh open
++  // description.
++  int duplicate =
++      openat(parent, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
++  if (duplicate < 0)
++    return -errno;
++  DIR *dir = fdopendir(duplicate);
++  if (!dir) {
++    int e = errno;
++    close(duplicate);
++    return -e;
++  }
++  size_t files = 0, bytes = 0;
++  int error = 0;
++  errno = 0;
++  while (auto entry = readdir(dir)) {
++    std::string name = entry->d_name;
++    if (name == "." || name == "..")
++      continue;
++    if (++files > 16) {
++      error = -ENOSPC;
++      break;
++    }
++    struct stat st{};
++    if (fstatat(parent, name.c_str(), &st, AT_SYMLINK_NOFOLLOW)) {
++      error = -errno;
++      break;
++    }
++    if (!S_ISREG(st.st_mode) || st.st_nlink != 1 || st.st_uid != uid ||
++        st.st_gid != gid || (st.st_mode & 07777) != 0600 ||
++        st.st_dev != ds.st_dev || st.st_size < 0) {
++      error = -EPERM;
++      break;
++    }
++    if (st.st_size > off_t(kMaxJournalBytes)) {
++      error = -EFBIG;
++      break;
++    }
++    bytes += size_t(st.st_size);
++    if (bytes > 1024 * 1024) {
++      error = -ENOSPC;
++      break;
++    }
++    errno = 0;
++  }
++  if (!error && errno)
++    error = -errno;
++  closedir(dir);
++  if (error)
++    return error;
++  if (files >= 16 || bytes + kMaxJournalBytes > 1024 * 1024)
++    return -ENOSPC;
++  int fd = openat(parent, (boot + ".journal").c_str(),
++                  O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
++  if (fd < 0)
++    return -errno;
++  struct stat st{};
++  if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_nlink != 1 ||
++      st.st_uid != uid || st.st_gid != gid || (st.st_mode & 07777) != 0600 ||
++      st.st_dev != ds.st_dev) {
++    close(fd);
++    return -EPERM;
++  }
++  std::array<unsigned char, 128> h{};
++  memcpy(h.data(), "TRONAJ1", 7);
++  Put32(h.data() + 8, 1);
++  Put32(h.data() + 12, kRecordBytes);
++  memcpy(h.data() + 16, boot.data(), 36);
++  memcpy(h.data() + 53, build.data(), build.size());
++  Put32(h.data() + 124, Crc(h.data(), 124));
++  error = WriteBounded(fd, h.data(), h.size(), write);
++  if (!error && fsync(fd))
++    error = -errno;
++  if (!error && fsync(parent))
++    error = -errno;
++  if (error) {
++    close(fd);
++    return error;
++  }
++  return fd;
++}
++int AppendBatch(int fd, const Record *records, size_t count, WriteFn writer,
++                SyncFn syncer) {
++  if (!records || !count)
++    return -EINVAL;
++  if (count > kMaxRecords)
++    return -E2BIG;
++  if (!writer)
++    writer = write;
++  if (!syncer)
++    syncer = fsync;
++  int e = CheckFile(fd);
++  if (e)
++    return e;
++  for (size_t i = 0; i < count; ++i)
++    if (!ValidRecord(records[i]) ||
++        (i && RecordSequence(records[i]) <= RecordSequence(records[i - 1])))
++      return -EINVAL;
++  std::array<unsigned char, 128> existing{};
++  if (pread(fd, existing.data(), existing.size(), 0) != 128)
++    return -EIO;
++  auto prefix = InspectJournal(
++      fd,
++      std::string(reinterpret_cast<const char *>(existing.data() + 16), 36));
++  if (prefix.error)
++    return prefix.error;
++  if (prefix.records + count > kMaxRecords)
++    return -E2BIG;
++  struct stat st{};
++  if (fstat(fd, &st))
++    return -errno;
++  size_t payload = count * kRecordBytes;
++  if (size_t(st.st_size) + payload + 96 > kMaxJournalBytes)
++    return -EFBIG;
++  std::array<unsigned char, 32> frame{};
++  memcpy(frame.data(), "BATCH1", 6);
++  Put32(frame.data() + 8, count);
++  Put32(frame.data() + 12, payload);
++  Put32(frame.data() + 16, Crc(records, payload));
++  Put32(frame.data() + 28, Crc(frame.data(), 28));
++  std::array<unsigned char, 32> end{};
++  memcpy(end.data(), "END1", 4);
++  Put32(end.data() + 8, RecordSequence(records[count - 1]));
++  Put32(end.data() + 12, Get32(frame.data() + 16));
++  Put32(end.data() + 28, Crc(end.data(), 28));
++  if (lseek(fd, 0, SEEK_END) < 0)
++    return -errno;
++  if ((e = WriteBounded(fd, frame.data(), frame.size(), writer)))
++    return e;
++  if ((e = WriteBounded(fd, records, payload, writer)))
++    return e;
++  if ((e = WriteBounded(fd, end.data(), end.size(), writer)))
++    return e;
++  if (syncer(fd))
++    return -errno;
++  memcpy(end.data(), "SYNC1", 5);
++  Put32(end.data() + 28, Crc(end.data(), 28));
++  if ((e = WriteBounded(fd, end.data(), end.size(), writer)))
++    return e;
++  if (syncer(fd))
++    return -errno;
++  return 0;
++}
++JournalResult InspectJournal(int fd, const std::string &boot) {
++  JournalResult out{};
++  if (!ValidBootId(boot))
++    return {-EINVAL, 0, false};
++  int e = CheckFile(fd);
++  if (e)
++    return {e, 0, false};
++  struct stat st{};
++  if (fstat(fd, &st))
++    return {-errno, 0, false};
++  std::vector<unsigned char> bytes(size_t(st.st_size));
++  size_t done = 0;
++  for (int i = 0; i < 32 && done < bytes.size(); ++i) {
++    ssize_t n = pread(fd, bytes.data() + done, bytes.size() - done, done);
++    if (n <= 0)
++      return {n < 0 ? -errno : -EIO, 0, false};
++    done += n;
++  }
++  if (done != bytes.size())
++    return {-EIO, 0, false};
++  auto p = bytes.data();
++  if (memcmp(p, "TRONAJ1", 7) || Get32(p + 8) != 1 || Get32(p + 12) != 128 ||
++      memcmp(p + 16, boot.data(), 36) || p[52] != 0 ||
++      Get32(p + 124) != Crc(p, 124))
++    return {-EBADMSG, 0, false};
++  size_t off = 128;
++  uint32_t previous = 0;
++  while (off < bytes.size()) {
++    if (bytes.size() - off < 32) {
++      out.error = -EBADMSG;
++      break;
++    }
++    p = bytes.data() + off;
++    uint32_t count = Get32(p + 8), len = Get32(p + 12), crc = Get32(p + 16);
++    if (memcmp(p, "BATCH1", 6) || count == 0 || count > kMaxRecords ||
++        len != count * 128 || Get32(p + 28) != Crc(p, 28) ||
++        bytes.size() - off < 32 + len + 32) {
++      out.error = -EBADMSG;
++      break;
++    }
++    auto data = p + 32;
++    if (Crc(data, len) != crc) {
++      out.error = -EBADMSG;
++      break;
++    }
++    bool valid = true;
++    uint32_t last = previous;
++    for (uint32_t i = 0; i < count; ++i) {
++      Record r{};
++      memcpy(r.data(), data + i * 128, 128);
++      if (!ValidRecord(r) || RecordSequence(r) <= last) {
++        valid = false;
++        break;
++      }
++      last = RecordSequence(r);
++    }
++    auto end = data + len;
++    if (!valid || memcmp(end, "END1", 4) || Get32(end + 8) != last ||
++        Get32(end + 12) != crc || Get32(end + 28) != Crc(end, 28)) {
++      out.error = -EBADMSG;
++      break;
++    }
++    out.sync_ack = false;
++    out.records += count;
++    previous = last;
++    off += 32 + len + 32;
++    if (bytes.size() - off < 32) {
++      out.error = -ENODATA;
++      break;
++    }
++    auto ack = bytes.data() + off;
++    if (memcmp(ack, "SYNC1", 5) || Get32(ack + 8) != last ||
++        Get32(ack + 12) != crc || Get32(ack + 28) != Crc(ack, 28)) {
++      out.error = -EBADMSG;
++      break;
++    }
++    out.sync_ack = true;
++    off += 32;
++  }
++  return out;
++}
++} // namespace trona_recorder
+diff --git a/init/trona_boot_recorder/recorder_core.h b/init/trona_boot_recorder/recorder_core.h
+new file mode 100644
+index 0000000..ac44e95
+--- /dev/null
++++ b/init/trona_boot_recorder/recorder_core.h
+@@ -0,0 +1,31 @@
++#pragma once
++#include <array>
++#include <cstdint>
++#include <string>
++#include <sys/types.h>
++namespace trona_recorder {
++constexpr size_t kRecordBytes = 128, kMaxRecords = 256,
++                 kMaxJournalBytes = 65536;
++using Record = std::array<unsigned char, kRecordBytes>;
++bool ValidBootId(const std::string &id);
++Record MakeRecord(uint32_t seq, uint32_t lost, uint16_t event, uint64_t ns,
++                  uint32_t detail, int32_t status, uint32_t source = 0,
++                  uint32_t line = 0);
++bool ValidRecord(const Record &record);
++uint32_t RecordSequence(const Record &record);
++int SendRecord(int fd, const Record &record);
++bool MatchMount(const std::string &text, const std::string &target,
++                unsigned major, unsigned minor);
++struct JournalResult {
++  int error = 0;
++  size_t records = 0;
++  bool sync_ack = false;
++};
++using WriteFn = ssize_t (*)(int, const void *, size_t);
++using SyncFn = int (*)(int);
++int OpenJournal(int parent, const std::string &boot, const std::string &build,
++                uid_t uid = 0, gid_t gid = 0);
++int AppendBatch(int fd, const Record *records, size_t count,
++                WriteFn writer = nullptr, SyncFn syncer = nullptr);
++JournalResult InspectJournal(int fd, const std::string &boot);
++} // namespace trona_recorder
+diff --git a/init/trona_boot_recorder/recorder_scope.h b/init/trona_boot_recorder/recorder_scope.h
+new file mode 100644
+index 0000000..1ba851f
+--- /dev/null
++++ b/init/trona_boot_recorder/recorder_scope.h
+@@ -0,0 +1,11 @@
++// SPDX-License-Identifier: Apache-2.0
++#pragma once
++
++// The product option is inherited by multiple init variants. Only normal
++// Android second-stage hooks may activate this diagnostic worker.
++#if defined(TRONA_EARLY_RECORDER) && defined(__ANDROID__) && !defined(MICRODROID) && \
++        !defined(RECOVERY) && !defined(FIRST_STAGE_INIT)
++#define TRONA_EARLY_RECORDER_ENABLED 1
++#else
++#define TRONA_EARLY_RECORDER_ENABLED 0
++#endif
+diff --git a/init/trona_boot_recorder/recorder_worker.cpp b/init/trona_boot_recorder/recorder_worker.cpp
+new file mode 100644
+index 0000000..9a1d0a8
+--- /dev/null
++++ b/init/trona_boot_recorder/recorder_worker.cpp
+@@ -0,0 +1,735 @@
++#include "recorder_worker.h"
++#include <array>
++#include <cerrno>
++#include <climits>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <dirent.h>
++#include <string>
++#include <fcntl.h>
++#include <poll.h>
++#include <signal.h>
++#include <sys/prctl.h>
++#include <sys/resource.h>
++#include <sys/socket.h>
++#include <sys/stat.h>
++#include <sys/statfs.h>
++#include <sys/statvfs.h>
++#include <sys/syscall.h>
++#include <sys/sysmacros.h>
++#include <time.h>
++#include <unistd.h>
++namespace trona_recorder {
++namespace {
++constexpr char kBuild[] = "early-boot-recorder-private-v2";
++constexpr char kDirectory[] = "trona-boot-recorder";
++constexpr char kCache[] = "/cache";
++constexpr char kBlock[] = "/dev/block/platform/bootdevice/by-name/cache";
++constexpr unsigned kDurationMs = 360000, kProbeMs = 1000, kMaxCheckpoints = 32;
++struct Producer {
++  int fd = -1;
++  uint32_t seq = 0, lost = 0;
++  bool attempted = false;
++} producer;
++uint64_t NowNs() {
++  struct timespec t{};
++  if (clock_gettime(CLOCK_MONOTONIC, &t))
++    return 0;
++  return uint64_t(t.tv_sec) * 1000000000ull + t.tv_nsec;
++}
++int ReadSmall(const char *path, std::string *out, size_t limit) {
++  int f = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
++  if (f < 0)
++    return -errno;
++  std::string value;
++  std::array<char, 4096> b{};
++  for (unsigned tries = 0; tries < 32; ++tries) {
++    ssize_t n = read(f, b.data(), b.size());
++    if (n < 0) {
++      int e = errno;
++      close(f);
++      return -e;
++    }
++    if (n == 0) {
++      close(f);
++      *out = value;
++      return 0;
++    }
++    if (value.size() + size_t(n) > limit) {
++      close(f);
++      return -EFBIG;
++    }
++    value.append(b.data(), n);
++  }
++  close(f);
++  return -E2BIG;
++}
++int DiscoverCacheDir(const char *name) {
++  std::string mounts;
++  int e = ReadSmall("/proc/self/mountinfo", &mounts, 65536);
++  if (e)
++    return e;
++  struct stat block{};
++  if (stat(kBlock, &block))
++    return -errno;
++  if (!S_ISBLK(block.st_mode))
++    return -ENODEV;
++  if (!MatchMount(mounts, kCache, major(block.st_rdev), minor(block.st_rdev)))
++    return -ENODEV;
++  int cache = open(kCache, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
++  if (cache < 0)
++    return -errno;
++  struct stat cs{};
++  struct statfs fs{};
++  if (fstat(cache, &cs) || fstatfs(cache, &fs)) {
++    e = -errno;
++    close(cache);
++    return e;
++  }
++  if (cs.st_dev != block.st_rdev || fs.f_type != 0xef53 ||
++      (fs.f_flags & ST_RDONLY)) {
++    close(cache);
++    return -ENODEV;
++  }
++  if (mkdirat(cache, name, 0700) && errno != EEXIST) {
++    e = -errno;
++    close(cache);
++    return e;
++  }
++  int dir = openat(cache, name,
++                   O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
++  if (dir < 0) {
++    e = -errno;
++    close(cache);
++    return e;
++  }
++  struct stat ds{}, link{};
++  bool ok = fstat(dir, &ds) == 0 &&
++            fstatat(cache, name, &link, AT_SYMLINK_NOFOLLOW) == 0 &&
++            S_ISDIR(ds.st_mode) && S_ISDIR(link.st_mode) &&
++            ds.st_dev == cs.st_dev && ds.st_ino == link.st_ino &&
++            ds.st_dev == link.st_dev && ds.st_uid == 0 && ds.st_gid == 0 &&
++            (ds.st_mode & 07777) == 0700;
++  close(cache);
++  if (!ok) {
++    close(dir);
++    return -EPERM;
++  }
++  return dir;
++}
++int DiscoverCache(void *) { return DiscoverCacheDir(kDirectory); }
++bool ValidateCache(int fd, void *ctx) {
++  int fresh = DiscoverCache(ctx);
++  if (fresh < 0)
++    return false;
++  struct stat a{}, b{};
++  bool ok = fstat(fd, &a) == 0 && fstat(fresh, &b) == 0 &&
++            a.st_dev == b.st_dev && a.st_ino == b.st_ino;
++  close(fresh);
++  return ok;
++}
++using Discover = int (*)(void *);
++using Validate = bool (*)(int, void *);
++constexpr size_t kPmsgFrameBytes = 256, kMaxPmsgFrames = 96;
++static_assert(kPmsgFrameBytes * kMaxPmsgFrames < 0x10000);
++using PmsgFrame = std::array<unsigned char, kPmsgFrameBytes>;
++uint32_t PmsgCrc(const unsigned char *p, size_t n) {
++  uint32_t c = ~0u;
++  for (size_t i = 0; i < n; ++i) {
++    c ^= p[i];
++    for (unsigned j = 0; j < 8; ++j)
++      c = (c >> 1) ^ ((c & 1) ? 0xedb88320u : 0);
++  }
++  return ~c;
++}
++void PmsgPut32(unsigned char *p, uint32_t n) {
++  for (unsigned i = 0; i < 4; ++i)
++    p[i] = n >> (i * 8);
++}
++uint32_t PmsgGet32(const unsigned char *p) {
++  return uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 |
++         uint32_t(p[3]) << 24;
++}
++PmsgFrame MakePmsgFrame(const std::string &boot, const Record &record,
++                        uint32_t ordinal) {
++  PmsgFrame f{};
++  if (!ValidBootId(boot) || !ValidRecord(record) || ordinal == 0 ||
++      ordinal > kMaxPmsgFrames)
++    return f;
++  memcpy(f.data(), "TRPMSG2", 7);
++  PmsgPut32(f.data() + 8, 2);
++  PmsgPut32(f.data() + 12, kPmsgFrameBytes);
++  memcpy(f.data() + 16, boot.data(), 36);
++  // Informational format tag, not build/cohort authentication.
++  static_assert(sizeof(kBuild) <= 32);
++  memcpy(f.data() + 52, kBuild, sizeof(kBuild));
++  PmsgPut32(f.data() + 84, ordinal);
++  memcpy(f.data() + 96, record.data(), record.size());
++  PmsgPut32(f.data() + 252, PmsgCrc(f.data(), 252));
++  return f;
++}
++bool ValidPmsgFrame(const void *data, size_t n) {
++  if (n != kPmsgFrameBytes)
++    return false;
++  auto p = static_cast<const unsigned char *>(data);
++  if (memcmp(p, "TRPMSG2\0", 8) || PmsgGet32(p + 8) != 2 ||
++      PmsgGet32(p + 12) != kPmsgFrameBytes ||
++      !ValidBootId(std::string(reinterpret_cast<const char *>(p + 16), 36)) ||
++      PmsgGet32(p + 84) == 0 || PmsgGet32(p + 84) > kMaxPmsgFrames ||
++      PmsgGet32(p + 252) != PmsgCrc(p, 252))
++    return false;
++  Record r{};
++  memcpy(r.data(), p + 96, r.size());
++  return ValidRecord(r);
++}
++bool PmsgNodeMatches(const struct stat &before, const struct stat &after) {
++  auto safe = [](const struct stat &s) {
++    return S_ISCHR(s.st_mode) && (s.st_mode & 07777) == 0222 && s.st_uid == 0 &&
++           s.st_gid == 1007 && s.st_nlink == 1;
++  };
++  return safe(before) && safe(after) && before.st_dev == after.st_dev &&
++         before.st_ino == after.st_ino && before.st_rdev == after.st_rdev;
++}
++bool PmsgLinkMatches(const std::string &link) {
++  return link == "../../devices/virtual/pmsg/pmsg0";
++}
++struct PmsgFd {
++  int fd;
++  explicit PmsgFd(int f) : fd(f) {}
++  ~PmsgFd() {
++    if (fd >= 0)
++      close(fd);
++  }
++  PmsgFd(const PmsgFd &) = delete;
++  PmsgFd &operator=(const PmsgFd &) = delete;
++};
++bool SameInode(const struct stat &a, const struct stat &b) {
++  return a.st_dev == b.st_dev && a.st_ino == b.st_ino;
++}
++int OpenPmsgAt(const char *node, const char *sysroot) {
++  struct stat before{}, after{}, final_node{};
++  if (lstat(node, &before))
++    return -errno;
++  if (!PmsgNodeMatches(before, before))
++    return -EPERM;
++  PmsgFd root(open(sysroot, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
++  if (root.fd < 0)
++    return -errno;
++  struct statfs fs{};
++  struct stat root_stat{};
++  if (fstatfs(root.fd, &fs) || fstat(root.fd, &root_stat))
++    return -errno;
++  if (fs.f_type != 0x62656572 || root_stat.st_uid != 0)
++    return -ENODEV;
++  PmsgFd chars(openat(root.fd, "dev/char",
++                      O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
++  PmsgFd target(openat(root.fd, "devices/virtual/pmsg/pmsg0",
++                       O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
++  if (chars.fd < 0 || target.fd < 0)
++    return -ENOENT; // No unsafe fallback.
++  struct stat chars_stat{}, target_stat{}, link_before{}, linked{},
++      link_after{};
++  if (fstat(chars.fd, &chars_stat) || fstat(target.fd, &target_stat))
++    return -errno;
++  if (chars_stat.st_dev != root_stat.st_dev ||
++      target_stat.st_dev != root_stat.st_dev)
++    return -ENODEV;
++  char name[64]{};
++  int n = snprintf(name, sizeof(name), "%u:%u", major(before.st_rdev),
++                   minor(before.st_rdev));
++  if (n <= 0 || size_t(n) >= sizeof(name))
++    return -EINVAL;
++  if (fstatat(chars.fd, name, &link_before, AT_SYMLINK_NOFOLLOW))
++    return -errno;
++  if (!S_ISLNK(link_before.st_mode) || link_before.st_dev != root_stat.st_dev ||
++      link_before.st_uid != 0)
++    return -ENODEV;
++  char link[128]{};
++  ssize_t length = readlinkat(chars.fd, name, link, sizeof(link));
++  if (length < 0)
++    return -errno;
++  if (size_t(length) >= sizeof(link) ||
++      !PmsgLinkMatches(std::string(link, length)))
++    return -ENODEV;
++  if (fstatat(chars.fd, name, &linked, 0) ||
++      fstatat(chars.fd, name, &link_after, AT_SYMLINK_NOFOLLOW))
++    return -errno;
++  if (!S_ISDIR(linked.st_mode) || !SameInode(linked, target_stat) ||
++      !SameInode(link_before, link_after))
++    return -ENODEV;
++  PmsgFd device(open(node, O_WRONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
++  if (device.fd < 0)
++    return -errno;
++  if (fstat(device.fd, &after) || lstat(node, &final_node))
++    return -errno;
++  if (!PmsgNodeMatches(before, after) || !PmsgNodeMatches(after, final_node))
++    return -EPERM;
++  // Kernel pmsg write ignores O_NONBLOCK: only this worker may call it.
++  int fd = device.fd;
++  device.fd = -1;
++  return fd;
++}
++int DiscoverPmsg(void *) { return OpenPmsgAt("/dev/pmsg0", "/sys"); }
++int Loop(int channel, unsigned duration, unsigned probe, Discover discover,
++         Validate validate, void *context, WriteFn writer, SyncFn syncer,
++         Discover pmsg_discover = nullptr, WriteFn pmsg_writer = nullptr) {
++  if (!pmsg_writer)
++    pmsg_writer = write;
++  std::string boot;
++  int e = ReadSmall("/proc/sys/kernel/random/boot_id", &boot, 64);
++  if (e)
++    return 2;
++  if (boot.size() == 37 && boot.back() == '\n')
++    boot.pop_back();
++  if (!ValidBootId(boot))
++    return 2;
++  const uint64_t start = NowNs();
++  if (!start)
++    return 2;
++  uint64_t next = start, next_pmsg = start;
++  const uint64_t end = start + uint64_t(duration) * 1000000ull;
++  std::array<Record, kMaxRecords> records{};
++  size_t count = 0, written = 0;
++  uint32_t last = 0;
++  unsigned checkpoints = 0;
++  int dir = -1, file = -1, result = 4;
++  bool eof = false, pmsg_disabled = pmsg_discover == nullptr;
++  int pmsg = -1;
++  size_t pmsg_sent = 0;
++  unsigned pmsg_attempts = 0, pmsg_probes = 0;
++  for (;;) {
++    for (unsigned i = 0; i < 32 && !eof; ++i) {
++      Record r{};
++      ssize_t n = recv(channel, r.data(), r.size(), MSG_DONTWAIT | MSG_TRUNC);
++      if (n < 0) {
++        if (errno == EAGAIN || errno == EWOULDBLOCK)
++          break;
++        result = 2;
++        goto done;
++      }
++      if (!n) {
++        eof = true;
++        break;
++      }
++      if (n != ssize_t(r.size()) || !ValidRecord(r) ||
++          RecordSequence(r) <= last) {
++        result = 2;
++        goto done;
++      }
++      last = RecordSequence(r);
++      if (count < records.size())
++        records[count++] = r;
++      else {
++        result = 3;
++        goto done;
++      }
++    }
++    uint64_t now = NowNs();
++    if (!now || now < start) {
++      result = 2;
++      goto done;
++    }
++    // Pre-cache sink: no filesystem checkpoint or later init event is needed.
++    // A blocked write can strand this worker, including its cache sink.
++    if (!pmsg_disabled && count > pmsg_sent) {
++      if (pmsg < 0 && now >= next_pmsg && pmsg_probes < 360) {
++        ++pmsg_probes;
++        next_pmsg = now + uint64_t(probe) * 1000000ull;
++        pmsg = pmsg_discover(context);
++        if (pmsg < 0 && pmsg != -ENOENT && pmsg != -EACCES)
++          pmsg_disabled = true;
++      }
++      if (pmsg >= 0) {
++        while (pmsg_sent < count && pmsg_attempts < kMaxPmsgFrames) {
++          auto frame = MakePmsgFrame(boot, records[pmsg_sent], ++pmsg_attempts);
++          if (!ValidPmsgFrame(frame.data(), frame.size()) ||
++              pmsg_writer(pmsg, frame.data(), frame.size()) !=
++                  ssize_t(frame.size())) {
++            pmsg_disabled = true;
++            break;
++          }
++          ++pmsg_sent;
++        }
++        if (pmsg_attempts >= kMaxPmsgFrames)
++          pmsg_disabled = true;
++        if (pmsg_disabled) {
++          close(pmsg);
++          pmsg = -1;
++        }
++      }
++    }
++    if (count > written && now >= next && checkpoints < kMaxCheckpoints) {
++      next = now + uint64_t(probe) * 1000000ull;
++      if (dir < 0)
++        dir = discover(context);
++      if (dir >= 0) {
++        if (!validate(dir, context)) {
++          result = 5;
++          goto done;
++        }
++        if (file < 0) {
++          file = OpenJournal(dir, boot, kBuild);
++          if (file < 0) {
++            result = 6;
++            goto done;
++          }
++        }
++        ++checkpoints;
++        struct stat st{};
++        if (fstat(file, &st) || st.st_uid != 0 || st.st_gid != 0 ||
++            st.st_nlink != 1) {
++          result = 6;
++          goto done;
++        }
++        e = AppendBatch(file, records.data() + written, count - written, writer,
++                        syncer);
++        if (e) {
++          result = 7;
++          goto done;
++        }
++        written = count;
++        next = now + uint64_t(duration / 24 > probe ? duration / 24 : probe) *
++                         1000000ull;
++        result = 0;
++      }
++    }
++    if (eof && written == count && count > 0) {
++      result = 0;
++      break;
++    }
++    if (now >= end) {
++      result = written == count && count > 0 ? 0 : 4;
++      break;
++    }
++    if (checkpoints >= kMaxCheckpoints) {
++      result = written == count ? 0 : 3;
++      break;
++    }
++    struct pollfd p{channel, POLLIN, 0};
++    int timeout = int((end - now) / 1000000ull);
++    if (timeout > 20)
++      timeout = 20;
++    if (timeout < 1)
++      timeout = 1;
++    // An EOF fd is never polled: otherwise POLLHUP creates an unbounded busy
++    // loop.
++    if (poll(eof ? nullptr : &p, eof ? 0 : 1, timeout) < 0 && errno != EINTR) {
++      result = 2;
++      break;
++    }
++  }
++done:
++  if (pmsg >= 0)
++    close(pmsg);
++  if (file >= 0)
++    close(file);
++  if (dir >= 0)
++    close(dir);
++  close(channel);
++  return result;
++}
++int ChildSetup(int channel, rlim_t file_limit, rlim_t cpu_limit,
++               const char *name) {
++  // This is called only in the single-threaded early child; never alter parent
++  // signals.
++  struct sigaction action{};
++  action.sa_handler = SIG_DFL;
++  sigemptyset(&action.sa_mask);
++  for (int s = 1; s < NSIG; ++s)
++    if (s != SIGKILL && s != SIGSTOP)
++      sigaction(s, &action, nullptr);
++  sigset_t set;
++  sigemptyset(&set);
++  if (sigprocmask(SIG_SETMASK, &set, nullptr))
++    return -errno;
++  if (channel >= 0 && channel != 3) {
++    if (dup3(channel, 3, O_CLOEXEC) < 0)
++      return -errno;
++    close(channel);
++  }
++  if (channel >= 0)
++    channel = 3;
++  DIR *list = opendir("/proc/self/fd");
++  if (!list)
++    return -errno;
++  int listfd = dirfd(list);
++  unsigned seen = 0;
++  int bad = 0;
++  for (;;) {
++    errno = 0;
++    auto entry = readdir(list);
++    if (!entry) {
++      bad = errno;
++      break;
++    }
++    if (entry->d_name[0] == '.')
++      continue;
++    if (++seen > 256) {
++      bad = E2BIG;
++      break;
++    }
++    char *end = nullptr;
++    long fd = strtol(entry->d_name, &end, 10);
++    if (!end || *end || fd < 0 || fd > INT_MAX) {
++      bad = EINVAL;
++      break;
++    }
++    if (fd > 2 && fd != channel && fd != listfd)
++      close(int(fd));
++  }
++  closedir(list);
++  if (bad)
++    return -bad;
++  struct rlimit files{32, 32}, size{file_limit, file_limit},
++      cpu{cpu_limit, cpu_limit};
++  if (setrlimit(RLIMIT_NOFILE, &files) || setrlimit(RLIMIT_FSIZE, &size) ||
++      setrlimit(RLIMIT_CPU, &cpu))
++    return -errno;
++  if (setpriority(PRIO_PROCESS, 0, 0))
++    return -errno;
++  prctl(PR_SET_NAME, name, 0, 0, 0);
++  alarm(kDurationMs / 1000);
++  return channel >= 0 ? channel : 0;
++}
++
++// Kernel-log copy for boots that reset without leaving a pstore record.
++// Logging only: bounded per file and per directory, and any failure just ends
++// this process. Kept out of the journal directory, whose reader accepts only
++// .journal names.
++constexpr char kKmsgDirectory[] = "trona-kmsg";
++constexpr size_t kKmsgMaxFiles = 6, kKmsgMaxBytes = 4 * 1024 * 1024,
++                 kKmsgRecordBytes = 8192;
++constexpr unsigned kKmsgFlushMs = 250, kKmsgWaitMs = 200;
++
++int DiscoverKmsgDir(void *) { return DiscoverCacheDir(kKmsgDirectory); }
++
++int KmsgOpenFile(int dir, const std::string &boot) {
++  int copy = dup(dir);
++  if (copy < 0)
++    return -errno;
++  DIR *list = fdopendir(copy);
++  if (!list) {
++    int e = -errno;
++    close(copy);
++    return e;
++  }
++  size_t files = 0;
++  while (auto entry = readdir(list))
++    if (entry->d_name[0] != '.')
++      ++files;
++  closedir(list);
++  if (files >= kKmsgMaxFiles)
++    return -ENOSPC;
++  std::string name = boot + ".kmsg";
++  int file = openat(dir, name.c_str(),
++                    O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
++  return file < 0 ? -errno : file;
++}
++
++bool KmsgWriteAll(int file, const char *data, size_t size) {
++  while (size) {
++    ssize_t n = write(file, data, size);
++    if (n < 0 && errno == EINTR)
++      continue;
++    if (n <= 0)
++      return false;
++    data += n;
++    size -= size_t(n);
++  }
++  return true;
++}
++
++int KmsgLoop(int kmsg, Discover discover, void *context, unsigned duration,
++             unsigned wait) {
++  std::string boot;
++  if (ReadSmall("/proc/sys/kernel/random/boot_id", &boot, 64))
++    return 2;
++  if (boot.size() == 37 && boot.back() == '\n')
++    boot.pop_back();
++  if (!ValidBootId(boot))
++    return 2;
++  const uint64_t start = NowNs();
++  if (!start)
++    return 2;
++  const uint64_t end = start + uint64_t(duration) * 1000000ull;
++  // The kernel buffer keeps early messages, so waiting for /cache loses none.
++  int dir = -1;
++  for (;;) {
++    dir = discover(context);
++    if (dir >= 0)
++      break;
++    if (NowNs() >= end)
++      return 4;
++    poll(nullptr, 0, int(wait));
++  }
++  int file = KmsgOpenFile(dir, boot);
++  close(dir);
++  if (file < 0)
++    return 6;
++  static char buffer[65536];
++  size_t pending = 0, total = 0;
++  uint64_t next_flush = 0;
++  int result = 0;
++  for (;;) {
++    bool stop = false;
++    while (pending + kKmsgRecordBytes <= sizeof(buffer)) {
++      ssize_t n = read(kmsg, buffer + pending, kKmsgRecordBytes);
++      if (n > 0) {
++        pending += size_t(n);
++        continue;
++      }
++      if (n < 0 && errno == EPIPE) // Records were overwritten: keep reading.
++        continue;
++      if (n < 0 && errno == EINTR)
++        continue;
++      if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
++        result = 2;
++        stop = true;
++      }
++      break;
++    }
++    uint64_t now = NowNs();
++    if (!now || now >= end)
++      stop = true;
++    bool full = pending + kKmsgRecordBytes > sizeof(buffer);
++    if (pending && (stop || full || now >= next_flush)) {
++      if (total + pending > kKmsgMaxBytes) {
++        result = 3;
++        break;
++      }
++      if (!KmsgWriteAll(file, buffer, pending) || fsync(file)) {
++        result = 7;
++        break;
++      }
++      total += pending;
++      pending = 0;
++      next_flush = now + uint64_t(kKmsgFlushMs) * 1000000ull;
++    }
++    if (stop)
++      break;
++    if (full)
++      continue;
++    struct pollfd p{kmsg, POLLIN, 0};
++    if (poll(&p, 1, 50) < 0 && errno != EINTR) {
++      result = 2;
++      break;
++    }
++    if (p.revents & (POLLHUP | POLLNVAL))
++      poll(nullptr, 0, 50);
++  }
++  close(file);
++  return result;
++}
++} // namespace
++bool IsInitThread(pid_t process, pid_t thread) {
++  return process == 1 && thread == 1;
++}
++void Start() {
++  int saved = errno;
++  if (!IsInitThread(getpid(), static_cast<pid_t>(syscall(SYS_gettid))) ||
++      producer.attempted) {
++    errno = saved;
++    return;
++  }
++  producer.attempted = true;
++  int s[2];
++  if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0,
++                 s)) {
++    errno = saved;
++    return;
++  }
++  int buffer = 16384;
++  if (setsockopt(s[0], SOL_SOCKET, SO_SNDBUF, &buffer, sizeof(buffer))) {
++    close(s[0]);
++    close(s[1]);
++    errno = saved;
++    return;
++  }
++  pid_t child = fork();
++  if (child == 0) {
++    close(s[0]);
++    int fd = ChildSetup(s[1], kMaxJournalBytes, 5, "trona-recorder");
++    if (fd < 0)
++      _exit(8);
++    _exit(Loop(fd, kDurationMs, kProbeMs, DiscoverCache, ValidateCache, nullptr,
++               nullptr, nullptr, DiscoverPmsg, nullptr));
++  }
++  close(s[1]);
++  if (child < 0)
++    close(s[0]);
++  else
++    producer.fd = s[0];
++  if (fork() == 0) {
++    if (ChildSetup(-1, kKmsgMaxBytes, 30, "trona-kmsg") < 0)
++      _exit(8);
++    int kmsg = open("/dev/kmsg", O_RDONLY | O_NONBLOCK | O_CLOEXEC);
++    if (kmsg < 0)
++      _exit(9);
++    _exit(KmsgLoop(kmsg, DiscoverKmsgDir, nullptr, kDurationMs, kKmsgWaitMs));
++  }
++  errno = saved;
++}
++uint32_t SourceId(const char *text) {
++  uint32_t hash = 2166136261u;
++  for (size_t n = 0; text && text[n] && n < 256; ++n) {
++    hash ^= static_cast<unsigned char>(text[n]);
++    hash *= 16777619u;
++  }
++  return hash;
++}
++void Mark(uint16_t event, uint32_t detail, int32_t status, uint32_t source,
++          uint32_t line) {
++  int saved = errno;
++  if (!IsInitThread(getpid(), static_cast<pid_t>(syscall(SYS_gettid))) ||
++      producer.fd < 0) {
++    errno = saved;
++    return;
++  }
++  if (producer.seq >= kMaxRecords) {
++    close(producer.fd);
++    producer.fd = -1;
++    errno = saved;
++    return;
++  }
++  if (producer.seq == kMaxRecords - 1) {
++    event = 65535;
++    detail = producer.seq;
++    status = -ENOSPC;
++  }
++  uint64_t now = NowNs();
++  auto record = MakeRecord(++producer.seq, producer.lost, event, now, detail,
++                           status, source, line);
++  int e = SendRecord(producer.fd, record);
++  if (e) {
++    if (producer.lost < UINT32_MAX)
++      ++producer.lost;
++    if (e != -EAGAIN && e != -EWOULDBLOCK) {
++      close(producer.fd);
++      producer.fd = -1;
++    }
++  }
++  errno = saved;
++}
++#ifdef TRONA_RECORDER_TEST
++namespace {
++int TestDiscover(void *context) {
++  int fd = *static_cast<int *>(context);
++  return fd < 0 ? -ENOENT : dup(fd);
++}
++bool TestValidate(int fd, void *context) {
++  struct stat a{}, b{};
++  return fstat(fd, &a) == 0 && fstat(*static_cast<int *>(context), &b) == 0 &&
++         a.st_ino == b.st_ino && a.st_dev == b.st_dev;
++}
++} // namespace
++int RunWorkerForTest(int channel, int directory, unsigned milliseconds,
++                     WriteFn writer, SyncFn syncer) {
++  return Loop(channel, milliseconds, 20, TestDiscover, TestValidate, &directory,
++              writer, syncer);
++}
++int RunKmsgForTest(int kmsg, int directory, unsigned milliseconds) {
++  return KmsgLoop(kmsg, TestDiscover, &directory, milliseconds, 10);
++}
++#endif
++} // namespace trona_recorder
+diff --git a/init/trona_boot_recorder/recorder_worker.h b/init/trona_boot_recorder/recorder_worker.h
+new file mode 100644
+index 0000000..c47841e
+--- /dev/null
++++ b/init/trona_boot_recorder/recorder_worker.h
+@@ -0,0 +1,15 @@
++#pragma once
++#include "recorder_core.h"
++#include <cstdint>
++namespace trona_recorder {
++bool IsInitThread(pid_t process, pid_t thread);
++void Start();
++void Mark(uint16_t event, uint32_t detail = 0, int32_t status = 0,
++          uint32_t source = 0, uint32_t line = 0);
++uint32_t SourceId(const char *text);
++#ifdef TRONA_RECORDER_TEST
++int RunWorkerForTest(int channel, int directory, unsigned milliseconds,
++                     WriteFn writer = nullptr, SyncFn syncer = nullptr);
++int RunKmsgForTest(int kmsg, int directory, unsigned milliseconds);
++#endif
++} // namespace trona_recorder
+diff --git a/init/trona_boot_recorder/service_events.h b/init/trona_boot_recorder/service_events.h
+new file mode 100755
+index 0000000..49eaf58
+--- /dev/null
++++ b/init/trona_boot_recorder/service_events.h
+@@ -0,0 +1,120 @@
++// SPDX-License-Identifier: Apache-2.0
++// Service lifecycle events for the Trona early-boot recorder (draft v3).
++// Pure helpers only: no I/O, no errno changes, no allocation. Used by
++// service.cpp when TRONA_EARLY_RECORDER_ENABLED; host-testable on its own.
++#pragma once
++#include <array>
++#include <cstdint>
++#include <string_view>
++
++namespace trona_recorder {
++
++// Additive event codes. Decoder v2 reports these as UNKNOWN_EVENT.
++constexpr uint16_t kServiceStartEnter = 360;   // priority services only, before Start() body
++constexpr uint16_t kServiceStartResult = 361;  // every Service::Start() return
++constexpr uint16_t kServiceReap = 460;         // reap not already covered by 450/401-404
++constexpr uint16_t kServiceCrashCount = 461;   // crash_count_ assignment inside Reap()
++constexpr uint16_t kServiceEventsSuppressed = 462;  // per-service budget reached
++constexpr uint16_t kServiceBudgetTableFull = 463;   // too many distinct services
++
++// kServiceStartResult detail bits. Status carries the error code (see StartStatus).
++constexpr uint32_t kStartForked = 1u << 0;         // start_order_ advanced: fork/clone succeeded in this call
++constexpr uint32_t kStartRunningBefore = 1u << 1;  // SVC_RUNNING before the call
++constexpr uint32_t kStartRunningAfter = 1u << 2;   // SVC_RUNNING after the call
++constexpr uint32_t kStartDisabledAfter = 1u << 3;  // SVC_DISABLED after the call
++constexpr uint32_t kStartFailed = 1u << 4;         // Start() returned an error Result
++constexpr uint32_t kStartErrorHasCode = 1u << 5;   // status is the Result error code (errno for ErrnoError)
++
++constexpr uint32_t StartDetail(bool forked, bool running_before, bool running_after,
++                               bool disabled_after, bool failed, int code) {
++    return (forked ? kStartForked : 0) | (running_before ? kStartRunningBefore : 0) |
++           (running_after ? kStartRunningAfter : 0) | (disabled_after ? kStartDisabledAfter : 0) |
++           (failed ? kStartFailed : 0) | (failed && code > 0 ? kStartErrorHasCode : 0);
++}
++
++// 0 = success. Failure: the Result error code when positive (an errno value for
++// ErrnoError), otherwise -1 meaning "Error() without a code". Never the
++// thread's errno, which Start() does not define on return.
++constexpr int32_t StartStatus(bool failed, int code) {
++    return !failed ? 0 : (code > 0 ? code : -1);
++}
++
++// kServiceCrashCount status bits.
++constexpr int32_t kCrashCritical = 1 << 0;    // SVC_CRITICAL
++constexpr int32_t kCrashWindowReset = 1 << 1;  // the "else" branch: count reset to 1
++
++// Services that also get a kServiceStartEnter record. Keep short: every entry
++// costs a record per start attempt from a fixed 256-record budget.
++constexpr std::array<std::string_view, 8> kPriorityServices = {
++        "keystore2",        "vendor.keymaster-3-0", "kisd",
++        "vold",             "servicemanager",       "hwservicemanager",
++        "vndservicemanager", "vendor.gatekeeper-1-0"};
++
++constexpr bool IsPriorityService(std::string_view name) {
++    for (auto candidate : kPriorityServices)
++        if (candidate == name) return true;
++    return false;
++}
++
++// Per-service record budget. A crash-looping service would otherwise consume
++// the whole boot budget and hide later events. The limit is per call, so
++// priority services can be given more room than the rest.
++enum class Admission { kRecord, kSuppressNow, kDrop, kTableFullNow };
++
++template <size_t Slots>
++class ServiceEventBudget {
++  public:
++    // Caller records the event on kRecord, a single kServiceEventsSuppressed
++    // marker on kSuppressNow, a single kServiceBudgetTableFull marker on
++    // kTableFullNow, and nothing on kDrop.
++    Admission Admit(uint32_t id, uint16_t limit) {
++        // Slots fill in order, so the first free slot means `id` is new.
++        for (auto& slot : slots_) {
++            if (slot.in_use && slot.id == id) return Step(slot, limit);
++            if (!slot.in_use) {
++                slot.id = id;
++                slot.in_use = true;
++                return Step(slot, limit);
++            }
++        }
++        if (table_full_marked_) return Admission::kDrop;
++        table_full_marked_ = true;
++        return Admission::kTableFullNow;
++    }
++
++  private:
++    struct Slot {
++        uint32_t id = 0;
++        uint16_t used = 0;
++        bool in_use = false;
++    };
++    static Admission Step(Slot& slot, uint16_t limit) {
++        if (slot.used < limit) {
++            ++slot.used;
++            return Admission::kRecord;
++        }
++        if (slot.used == limit) {
++            ++slot.used;
++            return Admission::kSuppressNow;
++        }
++        return Admission::kDrop;
++    }
++    std::array<Slot, Slots> slots_{};
++    bool table_full_marked_ = false;
++};
++
++constexpr size_t kBudgetSlots = 128;
++constexpr uint16_t kPerServiceLimit = 12;
++// Priority services: 24 covers five full enter/result/reap cycles (15 records),
++// i.e. a critical service's whole path to the fatal fifth crash, with room left.
++constexpr uint16_t kPriorityServiceLimit = 24;
++constexpr uint16_t ServiceLimit(bool priority) {
++    return priority ? kPriorityServiceLimit : kPerServiceLimit;
++}
++// Crash counts 1..5 (5 is init's fatal threshold for critical services) bypass the
++// per-service budget; only the global record cap applies. Higher counts occur only
++// for non-critical updatable services that keep looping and stay budgeted.
++constexpr uint32_t kCrashCountAlwaysRecorded = 5;
++using DefaultServiceEventBudget = ServiceEventBudget<kBudgetSlots>;
++
++}  // namespace trona_recorder
+diff --git a/libprocessgroup/profiles/cgroups_28.json b/libprocessgroup/profiles/cgroups_28.json
+index 17d4929..6864e6c 100644
+--- a/libprocessgroup/profiles/cgroups_28.json
++++ b/libprocessgroup/profiles/cgroups_28.json
+@@ -1,5 +1,13 @@
+ {
+   "Cgroups": [
++    {
++      "Controller": "blkio",
++      "Path": "/dev/blkio",
++      "Mode": "0775",
++      "UID": "system",
++      "GID": "system",
++      "Optional": true
++    },
+     {
+       "Controller": "schedtune",
+       "Path": "/dev/stune",
+diff --git a/libprocessgroup/setup/cgroup_map_write.cpp b/libprocessgroup/setup/cgroup_map_write.cpp
+index 0b26e95..0e73823 100644
+--- a/libprocessgroup/setup/cgroup_map_write.cpp
++++ b/libprocessgroup/setup/cgroup_map_write.cpp
+@@ -199,8 +199,17 @@ static bool MountV1CgroupController(const CgroupDescriptor& descriptor) {
+         options += ",noprefix,cpuset_v2_mode";
+     }
+ 
+-    if (mount("none", controller->path(), "cgroup", MS_NODEV | MS_NOEXEC | MS_NOSUID,
+-              options.c_str())) {
++    int mount_result = mount("none", controller->path(), "cgroup",
++                             MS_NODEV | MS_NOEXEC | MS_NOSUID, options.c_str());
++    if (mount_result && !strcmp(controller->name(), "cpuset") &&
++        (errno == ENOENT || errno == EINVAL)) {
++        // Older kernels reject cpuset_v2_mode. Keep noprefix and all mount protections;
++        // do not retry permission or other errors outside this option-rejection set.
++        LOG(WARNING) << "cpuset_v2_mode rejected; retrying legacy cpuset mount";
++        mount_result = mount("none", controller->path(), "cgroup",
++                             MS_NODEV | MS_NOEXEC | MS_NOSUID, "cpuset,noprefix");
++    }
++    if (mount_result) {
+         if (IsOptionalController(controller)) {
+             PLOG(INFO) << "Failed to mount optional controller " << controller->name();
+             return true;
+diff --git a/rootdir/init.rc b/rootdir/init.rc
+index 56024b9..d6c1c6b 100644
+--- a/rootdir/init.rc
++++ b/rootdir/init.rc
+@@ -82,6 +82,10 @@ on early-init
+     # Run the init_dev_config service to configure the device.
+     exec_start init_dev_config
+ 
++    # trona has no metadata partition; /metadata is a read-only directory on
++    # the system root. Give it writable, non-persistent storage for aconfigd.
++    mount tmpfs tmpfs /metadata nosuid nodev noexec mode=0755,uid=0,gid=0
++
+     # Fix permissions before apexd reads /metadata
+     restorecon /metadata
+ 
+diff --git a/rootdir/ueventd.rc b/rootdir/ueventd.rc
+index 80ef6a1..b8a1659 100644
+--- a/rootdir/ueventd.rc
++++ b/rootdir/ueventd.rc
+@@ -1,5 +1,6 @@
+ import /vendor/etc/ueventd.rc
+ import /odm/etc/ueventd.rc
++import /vendor/ueventd.rc
+ 
+ firmware_directories /etc/firmware/ /odm/firmware/ /vendor/firmware/ /firmware/image/
+ uevent_socket_rcvbuf_size 16M

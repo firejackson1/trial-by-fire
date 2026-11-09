@@ -1,0 +1,9 @@
+# Only netd publishes native-core readiness; init resets it before daemon/Java restart.
+system_internal_prop(trona_netd_ready_prop)
+set_prop(netd, trona_netd_ready_prop)
+get_prop(system_server, trona_netd_ready_prop)
+neverallow { domain -init -netd } trona_netd_ready_prop:property_service set;
+system_internal_prop(trona_netd_generation_prop)
+get_prop(netd, trona_netd_generation_prop)
+get_prop(system_server, trona_netd_generation_prop)
+neverallow { domain -init } trona_netd_generation_prop:property_service set;
