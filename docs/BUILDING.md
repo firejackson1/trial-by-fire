@@ -41,14 +41,15 @@ Pulls `/vendor/lib64/libcameracustom.so` from your tablet, checks it is the know
 
 ## Kernel
 
-The ROM needs its matching kernel: [amazon-mt8183-devs/android_kernel_amazon_mt8183](https://github.com/amazon-mt8183-devs/android_kernel_amazon_mt8183) at `kernel/base-revision.txt`, plus the three patches in `kernel/patches/` (build fixes and sensor suspend handling; xt_qtaguid, cfg80211/nl80211 wireless API, SELinux and audit updates for Android 17).
+The ROM needs its matching kernel: [amazon-mt8183-devs/android_kernel_amazon_mt8183](https://github.com/amazon-mt8183-devs/android_kernel_amazon_mt8183) at `kernel/base-revision.txt`, plus the four patches in `kernel/patches/` (build fixes and sensor suspend handling; xt_qtaguid, cfg80211/nl80211 wireless API, SELinux and audit updates; audio loader changes). `kernel/trona17wifiapi1.config` is the exact `.config` of the kernel running on the development tablet.
 
 ```bash
 git clone https://github.com/amazon-mt8183-devs/android_kernel_amazon_mt8183.git && cd android_kernel_amazon_mt8183
 git checkout $(cat /path/to/trial-by-fire/kernel/base-revision.txt)
 git am /path/to/trial-by-fire/kernel/patches/000[12]*.patch
 git apply /path/to/trial-by-fire/kernel/patches/0003-*.patch
-make ARCH=arm64 trona_defconfig && make ARCH=arm64 LOCALVERSION=-trona17wifiapi1 -j$(nproc)
+git apply /path/to/trial-by-fire/kernel/patches/0004-*.patch
+cp /path/to/trial-by-fire/kernel/trona17wifiapi1.config .config && make ARCH=arm64 olddefconfig && make ARCH=arm64 LOCALVERSION=-trona17wifiapi1 -j$(nproc)
 ```
 
 `LOCALVERSION=-trona17wifiapi1` matters: the system image's legacy network check accepts only the kernel release `4.4.302-lineage-trona17wifiapi1` on a `trona` vendor (see `system/netd/server/trona/`). The system image alone does not replace the kernel.

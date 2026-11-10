@@ -1,0 +1,27 @@
+From: firejackson1 <98654507+firejackson1@users.noreply.github.com>
+Subject: [PATCH] trona: audio loader changes for Android 17
+
+Kernel source of the build installed on the development tablet
+(4.4.302-lineage-trona17wifiapi1, built 2026-11-06), on top of 0003.
+---
+--- a/kernel/module.c
++++ b/kernel/module.c
+@@ -3496,8 +3496,6 @@
+ 	long err;
+ 	char *after_dashes;
+ 
+-        flags |= MODULE_INIT_IGNORE_MODVERSIONS;
+-	flags |= MODULE_INIT_IGNORE_VERMAGIC;
+ 
+ 	err = module_sig_check(info, flags);
+ 	if (err)
+--- a/sound/soc/mediatek/Makefile
++++ b/sound/soc/mediatek/Makefile
+@@ -85,6 +85,6 @@
+ 
+ obj-$(CONFIG_SND_SOC_MTK_BTCVSD) += common_int/
+ 
+-ifneq ($(filter maverick trona abc123 abx123,$(CONFIG_ARCH_MTK_PROJECT)),)
++ifneq ($(filter maverick trona abc123 abx123,$(subst ",,$(CONFIG_ARCH_MTK_PROJECT))),)
+ obj-y += amzn-mt8183-machine.o
+ endif
